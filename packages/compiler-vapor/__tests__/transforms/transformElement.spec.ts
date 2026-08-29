@@ -610,6 +610,16 @@ describe('compiler: element transform', () => {
   ]`)
     })
 
+    test('props merging: event handlers with modifiers', () => {
+      const { code } = compileWithElementTransform(
+        `<Foo @keydown.enter.prevent="a" @keydown.esc.prevent="b" />`,
+      )
+      expect(code).contains(`onKeydown: () => [
+    _withKeys(_withModifiers(_ctx.a, ["prevent"]), ["enter"]),
+    _withKeys(_withModifiers(_ctx.b, ["prevent"]), ["esc"])
+  ]`)
+    })
+
     test('props merging: inline event handlers', () => {
       const { code } = compileWithElementTransform(
         `<Foo @click.foo="e => a(e)" @click.bar="e => b(e)" />`,
@@ -1587,10 +1597,19 @@ describe('compiler: element transform', () => {
       ],
     })
 
-    expect(ir.block.operation).toMatchObject([
-      { type: IRNodeTypes.INSERT_NODE, parent: 1, elements: [0] },
-      { type: IRNodeTypes.INSERT_NODE, parent: 3, elements: [2] },
-    ])
+    // INSERT_NODE now lives on the moved child's own dynamic info so it is
+    // emitted inline in source order, not as a block-level operation
+    expect(ir.block.operation).toMatchObject([])
+    expect(ir.block.dynamic.children[0].children[0].operation).toMatchObject({
+      type: IRNodeTypes.INSERT_NODE,
+      parent: 1,
+      elements: [0],
+    })
+    expect(ir.block.dynamic.children[1].children[0].operation).toMatchObject({
+      type: IRNodeTypes.INSERT_NODE,
+      parent: 3,
+      elements: [2],
+    })
   })
 
   test('invalid table nesting with dynamic child', () => {
@@ -1783,19 +1802,19 @@ describe('compiler: element transform', () => {
       )
 
       const template =
-        '<div title="has whitespace"inert data-targets="foo>bar">'
+        '<div title="has whitespace" inert data-targets="foo>bar">'
       expect(code).toMatchSnapshot()
       expect(code).contains(JSON.stringify(template))
       expect([...ir.template.keys()]).toMatchObject([template])
     })
 
-    test('space omitted after quoted attribute', () => {
+    test('space kept after quoted attribute', () => {
       const { code, ir } = compileWithElementTransform(
         `<div title="has whitespace" alt='"contains quotes"' data-targets="foo>bar" />`,
       )
 
       const template =
-        '<div title="has whitespace"alt="&quot;contains quotes&quot;"data-targets="foo>bar">'
+        '<div title="has whitespace" alt="&quot;contains quotes&quot;" data-targets="foo>bar">'
       expect(code).toMatchSnapshot()
       expect(code).contains(JSON.stringify(template))
       expect([...ir.template.keys()]).toMatchObject([template])

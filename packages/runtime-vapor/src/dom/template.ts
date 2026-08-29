@@ -1,10 +1,12 @@
 import {
+  type AdoptTarget,
   adoptTemplate,
   advanceHydrationNode,
   currentHydrationNode,
   hydrateTextNode,
   isComment,
   isHydrating,
+  parseAdoptTarget,
   resolveHydrationTarget,
   validateHydrationTarget,
 } from './hydration'
@@ -14,11 +16,25 @@ import { resolvePendingSlotContent } from './hydrateFragment'
 
 let t: HTMLTemplateElement
 
+// Clone provider installed by the scope id module while slotted ids are live
+// (this module imports no scope machinery; the common path is one null
+// check). Serves clones carrying the active ids from a stamped-variant cache.
+export let templateCloneHook: ((prototype: Node) => Node) | null = null
+
+export function setTemplateCloneHook(
+  hook: ((prototype: Node) => Node) | null,
+): void {
+  templateCloneHook = hook
+}
+
 /*@__NO_SIDE_EFFECTS__*/
 export function template(html: string, flags: number = 0, ns?: Namespace) {
   const root = !!(flags & TemplateFlags.ROOT)
   const isStatic = !!(flags & TemplateFlags.STATIC)
   let node: Node
+  // parsed once on first hydration adoption; every later instance of this
+  // template compares against the cached form instead of re-scanning `html`
+  let adoptTarget: AdoptTarget | undefined
   return (): Node & { $root?: true } => {
     if (isHydrating) {
       // Comment templates may be empty branch anchors. Only real DOM/text
@@ -57,14 +73,22 @@ export function template(html: string, flags: number = 0, ns?: Namespace) {
         advanceHydrationNode(adopted)
       } else {
         // do not assign `adopted` to `node`, or CSR clones would duplicate children.
-        adopted = adoptTemplate(currentHydrationNode!, html, false, ns)!
+        adopted = adoptTemplate(
+          currentHydrationNode!,
+          html,
+          false,
+          ns,
+          (adoptTarget ||= parseAdoptTarget(html)),
+        )!
       }
       if (root) (adopted as any).$root = true
       return adopted
     }
 
     if (node) {
-      const ret = node.cloneNode(true)
+      const ret = templateCloneHook
+        ? templateCloneHook(node)
+        : node.cloneNode(true)
       if (root) (ret as any).$root = true
       return ret
     }
@@ -82,7 +106,9 @@ export function template(html: string, flags: number = 0, ns?: Namespace) {
       t.innerHTML = html
       node = _child(t.content)
     }
-    const ret = node.cloneNode(true)
+    const ret = templateCloneHook
+      ? templateCloneHook(node)
+      : node.cloneNode(true)
     if (root) (ret as any).$root = true
     return ret
   }

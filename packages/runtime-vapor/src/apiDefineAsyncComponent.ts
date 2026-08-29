@@ -111,10 +111,10 @@ export function defineVaporAsyncComponent<T extends VaporComponent>(
         TransitionOptions
       markAsyncBoundary(instance)
 
-      const frag =
-        __DEV__ || isHydrating
-          ? new DynamicFragment('async component')
-          : new DynamicFragment()
+      const frag = new DynamicFragment(
+        0,
+        __DEV__ ? 'async component' : undefined,
+      )
 
       // already resolved
       let resolvedComp = getResolvedComp()

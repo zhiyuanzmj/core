@@ -417,26 +417,20 @@ function transformNativeElement(
       getEffectIndex,
     )
   } else {
-    // tracks if previous attribute was quoted, allowing space omission
-    // e.g. `class="foo"id="bar"` is valid, `class=foo id=bar` needs space
-    let prevWasQuoted = false
     const appendTemplateProp = (
       key: string,
       value: string = '',
       generated: boolean = false,
     ) => {
-      if (!prevWasQuoted) template += ` `
-      template += key
+      template += ` ${key}`
 
       if (value) {
         const escapedValue = generated
           ? escapeGeneratedAttrValue(value)
           : value.replace(/"/g, '&quot;')
-        template += (prevWasQuoted = NEEDS_QUOTES_RE.test(value))
+        template += NEEDS_QUOTES_RE.test(value)
           ? `="${escapedValue}"`
           : `=${escapedValue}`
-      } else {
-        prevWasQuoted = false
       }
     }
 
@@ -452,11 +446,9 @@ function transformNativeElement(
           values[0].content.includes(imported.exp.content),
         )
       ) {
-        if (!prevWasQuoted) template += ` `
         // add start and end markers to the import expression, so it can be replaced
         // with string concatenation in the generator, see genTemplates
-        template += `${key.content}="${IMPORT_EXP_START}${values[0].content}${IMPORT_EXP_END}"`
-        prevWasQuoted = true
+        template += ` ${key.content}="${IMPORT_EXP_START}${values[0].content}${IMPORT_EXP_END}"`
       } else if (
         canStringifyAttrName &&
         values.length === 1 &&
@@ -468,8 +460,8 @@ function transformNativeElement(
       } else if (
         canStringifyAttrName &&
         !prop.modifier &&
-        isBooleanAttr(key.content) &&
-        (foldedValue = foldBooleanAttrValue(values)) != null
+        (isBooleanAttr(key.content) || key.content === 'hidden') &&
+        (foldedValue = foldBooleanAttrValue(key.content, values)) != null
       ) {
         if (foldedValue) {
           appendTemplateProp(key.content)
@@ -536,6 +528,7 @@ function escapeGeneratedAttrValue(value: string): string {
 }
 
 function foldBooleanAttrValue(
+  key: string,
   values: SimpleExpressionNode[],
 ): boolean | undefined {
   if (values.length !== 1) return
@@ -544,6 +537,9 @@ function foldBooleanAttrValue(
   if (!evaluated) return
 
   const value = evaluated.value
+  if (key === 'hidden' && typeof value === 'number') {
+    return includeBooleanAttr(value)
+  }
   if (value === true || value === false || value == null) {
     return includeBooleanAttr(value)
   }
@@ -1259,7 +1255,10 @@ function dedupeProperties(results: DirectiveTransformResult[]): IRProp[] {
     // prop names and event handler names can be the same but serve different purposes
     // e.g. `:appear="true"` is a prop while `@appear="handler"` is an event handler
     if (existing && existing.handler === prop.handler) {
-      if (name === 'style' || name === 'class' || prop.handler) {
+      if (prop.handler) {
+        // keep modifiers associated with each handler; codegen merges matching keys
+        deduped.push(prop)
+      } else if (name === 'style' || name === 'class') {
         mergePropValues(existing, prop)
       }
       // unexpected duplicate, should have emitted error during parse

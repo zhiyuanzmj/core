@@ -5,7 +5,6 @@ import {
   canSetValueDirectly,
   getEscapedCssVarName,
   includeBooleanAttr,
-  isArray,
   isOn,
   isSpecialBooleanAttr,
   isString,
@@ -46,7 +45,7 @@ import {
 import {
   type VaporComponentInstance,
   isApplyingFallthroughProps,
-  isVaporComponent,
+  isDeclaredModelListener,
   shouldUseFunctionalFallthrough,
 } from '../component'
 import {
@@ -75,6 +74,9 @@ const shouldSkipFallthroughKey = (el: TargetElement, key: string) => {
     instance.hasFallthrough &&
     instance.type.inheritAttrs !== false &&
     key in instance.attrs &&
+    // skip only keys fallthrough will actually write: v-model listeners
+    // with a declared prop are filtered out of the fallthrough set
+    !isDeclaredModelListener(instance, key) &&
     (!shouldUseFunctionalFallthrough(instance.type) ||
       isFunctionalFallthroughKey(key))
   )
@@ -156,14 +158,17 @@ export function setDOMProp(
     }
   }
 
-  const prev = el[key]
-  if (value === prev) {
+  // DOM properties may normalize values differently from reflected attributes,
+  // so compare against the previous binding and always perform the initial set.
+  const cacheKey = `$p$${key}`
+  if (value === el[cacheKey] && cacheKey in el) {
     return
   }
+  el[cacheKey] = value
 
   let needRemove = false
   if (value === '' || value == null) {
-    const type = typeof prev
+    const type = typeof el[key]
     if (type === 'boolean') {
       value = includeBooleanAttr(value)
     } else if (value == null && type === 'string') {
@@ -398,8 +403,12 @@ export function setValue(
   if (oldValue !== newValue) {
     el.value = newValue
   }
+  // #6007 also set value as an attribute so it works with
+  // <input type="reset"> or libs / extensions that expect attributes
   if (value == null) {
     el.removeAttribute('value')
+  } else {
+    el.setAttribute('value', isSymbol(newValue) ? String(newValue) : newValue)
   }
 }
 
@@ -461,46 +470,6 @@ export function setElementText(
   }
 }
 
-export function setBlockText(
-  block: Block & { $txt?: string },
-  value: unknown,
-): void {
-  value = value == null ? '' : value
-  if (block.$txt !== value) {
-    setTextToBlock(block, (block.$txt = value as string))
-  }
-}
-
-/**
- * dev only
- */
-function warnCannotSetProp(prop: string): void {
-  warn(
-    `Extraneous non-props attributes (` +
-      `${prop}) ` +
-      `were passed to component but could not be automatically inherited ` +
-      `because component renders text or multiple root nodes.`,
-  )
-}
-
-function setTextToBlock(block: Block, value: any): void {
-  if (block instanceof Node) {
-    if (block instanceof Element) {
-      block.textContent = value
-    } else if (__DEV__) {
-      warnCannotSetProp('textContent')
-    }
-  } else if (isVaporComponent(block)) {
-    setTextToBlock(block.block, value)
-  } else if (isArray(block)) {
-    if (__DEV__) {
-      warnCannotSetProp('textContent')
-    }
-  } else {
-    setTextToBlock(block.nodes, value)
-  }
-}
-
 export function setHtml(el: TargetElement, value: any): void {
   value = value == null ? '' : unsafeToTrustedHTML(value)
   // Align with vdom hydration: server-rendered innerHTML content is trusted
@@ -512,39 +481,6 @@ export function setHtml(el: TargetElement, value: any): void {
   }
   if (el.$html !== value) {
     el.innerHTML = el.$html = value
-  }
-}
-
-export function setBlockHtml(
-  block: Block & { $html?: string },
-  value: any,
-): void {
-  value = value == null ? '' : unsafeToTrustedHTML(value)
-  // trust SSR content during hydration, see setHtml
-  if (isHydrating) {
-    block.$html = value
-    return
-  }
-  if (block.$html !== value) {
-    setHtmlToBlock(block, (block.$html = value))
-  }
-}
-
-function setHtmlToBlock(block: Block, value: any): void {
-  if (block instanceof Node) {
-    if (block instanceof Element) {
-      block.innerHTML = value
-    } else if (__DEV__) {
-      warnCannotSetProp('innerHTML')
-    }
-  } else if (isVaporComponent(block)) {
-    setHtmlToBlock(block.block, value)
-  } else if (isArray(block)) {
-    if (__DEV__) {
-      warnCannotSetProp('innerHTML')
-    }
-  } else {
-    setHtmlToBlock(block.nodes, value)
   }
 }
 
@@ -646,7 +582,7 @@ export function optimizePropertyLookup(): void {
   const proto = Element.prototype as any
   proto.$transition = undefined
   proto.$key = undefined
-  proto.$fc = proto.$evtclick = undefined
+  proto.$evtclick = undefined
   proto.$root = false
   proto.$clsFlags = undefined
   proto.$html = proto.$cls = proto.$sty = ''

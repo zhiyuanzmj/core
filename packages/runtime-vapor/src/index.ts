@@ -20,7 +20,7 @@ export {
 
 // compiler-use only
 export { extend } from '@vue/shared'
-export { insert, prepend, remove, type Block } from './block'
+export { insert, remove, type Block } from './block'
 export { setInsertionState } from './insertionState'
 export {
   createComponent,
@@ -37,9 +37,7 @@ export { template } from './dom/template'
 export { createTextNode, child, nthChild, next, txt } from './dom/node'
 export {
   setText,
-  setBlockText,
   setHtml,
-  setBlockHtml,
   setClass,
   setClassName,
   setStyle,

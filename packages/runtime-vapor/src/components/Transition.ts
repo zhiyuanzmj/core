@@ -35,8 +35,6 @@ import {
 } from '../block'
 import {
   displayName,
-  getInteropTransitionElement,
-  getInteropTransitionType,
   isVaporTransition,
   registerTransitionHooks,
 } from '../transition'
@@ -165,7 +163,7 @@ export const VaporTransition: FunctionalVaporComponent<TransitionProps> =
     // Dynamic slot sources can add/remove the default slot after setup, so
     // Transition needs a DynamicFragment to drive enter/leave on updates.
     if (instance.rawSlots.$) {
-      const frag = new DynamicFragment('transition')
+      const frag = new DynamicFragment(0, __DEV__ ? 'transition' : undefined)
       let isMounted = false
       renderEffect(() => {
         if (!frag.$transition) {
@@ -184,16 +182,18 @@ export const VaporTransition: FunctionalVaporComponent<TransitionProps> =
           shouldCaptureVShow && !isMounted,
           () => frag.update(slots.default),
         )
-        let hasStructuralRoot = false
-        const root = resolveTransitionBlock(frag.nodes, fragment => {
-          hasStructuralRoot ||= isStructuralTransitionFragment(fragment)
-        })
-        applyPendingVShows(
-          frag.$transition!,
-          root,
-          pendingVShows,
-          hasStructuralRoot,
-        )
+        if (pendingVShows && pendingVShows.length) {
+          let hasStructuralRoot = false
+          const root = resolveTransitionBlock(frag.nodes, fragment => {
+            hasStructuralRoot ||= isStructuralTransitionFragment(fragment)
+          })
+          applyPendingVShows(
+            frag.$transition!,
+            root,
+            pendingVShows,
+            hasStructuralRoot,
+          )
+        }
         if (!isMounted && shouldPerformAppear) performAppear(frag.$transition!)
         isMounted = true
       })
@@ -241,8 +241,8 @@ function getTransitionType(block: ResolvedTransitionBlock): any {
   const type = transitionTypeMap.get(block)
   if (type !== undefined) return type
   if (block instanceof Element) return block.localName
-  if (isInteropEnabled && isFragment(block) && block.vnode) {
-    const type = getInteropTransitionType(block.vnode)
+  if (isInteropEnabled && isFragment(block) && block.getTransitionType) {
+    const type = block.getTransitionType()
     if (type !== undefined) return type
   }
   return block
@@ -661,8 +661,6 @@ function collectArrayTransitionBlocks(
   let hasFound = false
   for (const c of block) {
     if (c instanceof Comment) continue
-    const nested: ResolvedTransitionBlock[] = []
-    collectTransitionBlocks(c, onFragment, nested)
     if (__DEV__ && hasFound) {
       // warn more than one non-comment child
       warn(
@@ -671,6 +669,8 @@ function collectArrayTransitionBlocks(
       )
       break
     }
+    const nested: ResolvedTransitionBlock[] = []
+    collectTransitionBlocks(c, onFragment, nested)
     if (nested.length) children.push(nested[0])
     hasFound = true
     if (!__DEV__) break
@@ -682,9 +682,9 @@ function collectFragmentTransitionBlocks(
   onFragment: ((frag: VaporFragment) => void) | undefined,
   children: ResolvedTransitionBlock[],
 ): void {
-  if (isInteropEnabled && block.vnode) {
+  if (isInteropEnabled && block.hasVDOMContent && block.hasVDOMContent()) {
     children.push(block)
-    const type = getInteropTransitionType(block.vnode)
+    const type = block.getTransitionType!()
     if (type !== undefined) setTransitionType(block, type)
     return
   }
@@ -726,9 +726,14 @@ export function setTransitionHooks(
 export function isValidTransitionBlock(
   block: Block,
 ): block is ResolvedTransitionBlock {
-  return !!(
+  return (
     block instanceof Element ||
-    (isInteropEnabled && isFragment(block) && block.vnode)
+    !!(
+      isInteropEnabled &&
+      isFragment(block) &&
+      block.hasVDOMContent &&
+      block.hasVDOMContent()
+    )
   )
 }
 
@@ -738,8 +743,8 @@ export function getTransitionElement(
   if (block instanceof Element) return block
 
   // vdom interop
-  if (isInteropEnabled && isFragment(block) && block.vnode) {
-    return getInteropTransitionElement(block.vnode)
+  if (isInteropEnabled && isFragment(block) && block.getTransitionElement) {
+    return block.getTransitionElement()
   }
 }
 

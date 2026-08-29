@@ -5,8 +5,7 @@ import {
   mountComponent,
   unmountComponent,
 } from './component'
-import { _child } from './dom/node'
-import { isComment, isHydrating } from './dom/hydration'
+import { isClaimedAnchor, isComment, isHydrating } from './dom/hydration'
 import {
   MoveType,
   type TransitionHooks,
@@ -23,7 +22,7 @@ import {
 import { isTeleportEnabled, isTeleportFragment } from './teleport'
 import { isTransitionEnabled } from './transition'
 import { isInteropEnabled } from './vdomInteropState'
-import { isSuspenseEnabled } from './suspense'
+import { isSuspenseEnabled, resolveUnmountSuspense } from './suspense'
 
 export interface VaporTransitionHooks extends TransitionHooks {
   __vapor: true
@@ -81,7 +80,9 @@ export function isValidBlock(
   if (!block) {
     return false
   } else if (block instanceof Node) {
-    return !(block instanceof Comment)
+    // Claimed structural anchors are text nodes in prod; excluding them by
+    // marker keeps validity identical across dev (comment) and prod shapes.
+    return !(block instanceof Comment) && !isClaimedAnchor(block)
   } else if (isVaporComponent(block)) {
     return componentAsValid || isValidBlock(block.block, componentAsValid)
   } else if (isArray(block)) {
@@ -105,8 +106,8 @@ export function isValidSlot(block: Block | null | undefined): boolean {
 
 export function insert(
   block: Block,
-  parent: ParentNode & { $fc?: Node | null },
-  anchor: Node | null | 0 = null, // 0 means prepend
+  parent: ParentNode,
+  anchor: Node | null = null,
   parentSuspense?: any, // TODO Suspense
 ): void {
   if (block instanceof Node) {
@@ -115,14 +116,12 @@ export function insert(
   }
 
   if (isVaporComponent(block)) {
-    anchor = anchor === 0 ? parent.$fc || _child(parent) : anchor
     if (block.isMounted && !block.isDeactivated) {
       insert(block.block!, parent, anchor, parentSuspense)
     } else {
       mountComponent(block, parent, anchor)
     }
   } else if (isArray(block)) {
-    anchor = anchor === 0 ? parent.$fc || _child(parent) : anchor
     for (const b of block) {
       insert(b, parent, anchor, parentSuspense)
     }
@@ -133,11 +132,10 @@ export function insert(
 
 export function insertNode(
   block: Node,
-  parent: ParentNode & { $fc?: Node | null },
-  anchor: Node | null | 0 = null, // 0 means prepend
+  parent: ParentNode,
+  anchor: Node | null = null,
   parentSuspense?: any, // TODO Suspense
 ): void {
-  anchor = anchor === 0 ? parent.$fc || _child(parent) : anchor
   if (!isHydrating) {
     // only apply transition on Element nodes
     if (
@@ -152,7 +150,12 @@ export function insertNode(
         () => parent.insertBefore(block, anchor as Node),
         parentSuspense,
       )
-    } else {
+    } else if (block !== anchor) {
+      // `block === anchor` happens when a fragment's own anchor travels
+      // inside its `nodes` (ForFragment, vdom interop fragments), when a
+      // fragment re-inserts at its own position (Teleport), or when an
+      // adopted template placeholder is passed back as the insertion target —
+      // all established idempotent no-ops. Skip the wasted insertBefore.
       parent.insertBefore(block, anchor)
     }
   }
@@ -160,14 +163,14 @@ export function insertNode(
 
 export function insertFragment(
   block: VaporFragment | DynamicFragment,
-  parent: ParentNode & { $fc?: Node | null },
-  anchor: Node | null | 0 = null, // 0 means prepend
+  parent: ParentNode,
+  anchor: Node | null = null,
   parentSuspense?: any, // TODO Suspense
 ): void {
-  anchor = anchor === 0 ? parent.$fc || _child(parent) : anchor
-  if (block.anchor) {
-    insertNode(block.anchor, parent, anchor, parentSuspense)
-    anchor = block.anchor
+  const blockAnchor = block.anchor
+  if (blockAnchor) {
+    insertNode(blockAnchor, parent, anchor, parentSuspense)
+    anchor = blockAnchor
   }
   if (block.insert) {
     block.insert(
@@ -183,13 +186,12 @@ export function insertFragment(
 
 export function move(
   block: Block,
-  parent: ParentNode & { $fc?: Node | null },
-  anchor: Node | null | 0 = null, // 0 means prepend
+  parent: ParentNode,
+  anchor: Node | null = null,
   moveType: MoveType = MoveType.LEAVE,
   parentComponent?: VaporComponentInstance,
   parentSuspense?: any, // TODO Suspense
 ): void {
-  anchor = anchor === 0 ? parent.$fc || _child(parent) : anchor
   if (block instanceof Node) {
     // only apply transition on Element nodes
     if (
@@ -267,6 +269,7 @@ export function move(
         anchor,
         parentSuspense,
         (block as TransitionBlock).$transition,
+        moveType,
       )
     } else {
       move(
@@ -281,22 +284,51 @@ export function move(
   }
 }
 
-export function prepend(parent: ParentNode, ...blocks: Block[]): void {
-  let i = blocks.length
-  while (i--) insert(blocks[i], parent, 0)
-}
-
 export function remove(block: Block, parent?: ParentNode): void {
   if (block instanceof Node) {
     removeNode(block, parent)
   } else if (isVaporComponent(block)) {
-    unmountComponent(block, parent)
+    unmountComponent(
+      block,
+      parent,
+      __FEATURE_SUSPENSE__ && isSuspenseEnabled && isInteropEnabled
+        ? resolveUnmountSuspense(block.suspense)
+        : block.suspense,
+    )
   } else if (isArray(block)) {
     for (let i = 0; i < block.length; i++) {
       remove(block[i], parent)
     }
   } else {
     removeFragment(block, parent)
+  }
+}
+
+// Detach a live block from `parent` without running fragment/component teardown.
+// Slot content uses this while an enclosing fallback temporarily owns the DOM.
+export function removeAttachedNodes(
+  block: Block,
+  parent: ParentNode,
+  removeAnchors: boolean = true,
+): void {
+  if (block instanceof Node) {
+    if (block.parentNode === parent) {
+      removeNode(block, parent)
+    }
+  } else if (isVaporComponent(block)) {
+    if (block.block) {
+      removeAttachedNodes(block.block, parent, removeAnchors)
+    }
+  } else if (isArray(block)) {
+    for (let i = 0; i < block.length; i++) {
+      removeAttachedNodes(block[i], parent, removeAnchors)
+    }
+  } else {
+    removeAttachedNodes(block.nodes, parent, removeAnchors)
+    const anchor = block.anchor
+    if (removeAnchors && anchor && anchor.parentNode === parent) {
+      removeNode(anchor, parent)
+    }
   }
 }
 
@@ -364,7 +396,12 @@ export function normalizeBlock(block: Block): Node[] {
   return nodes
 }
 
-export function getBlockFirstNode(block: Block): Node {
+/**
+ * First node of a block as it appears in its own container, or `undefined`
+ * when the block has no node there: an empty array of blocks, or a block
+ * whose content lives elsewhere (a teleport target) and has no marker left.
+ */
+export function getBlockFirstNode(block: Block): Node | undefined {
   if (block instanceof Node) {
     return block
   } else if (isArray(block)) {
@@ -372,10 +409,17 @@ export function getBlockFirstNode(block: Block): Node {
       const anchor = getBlockFirstNode(block[i])
       if (anchor) return anchor
     }
-    return undefined!
+    return undefined
   } else if (isVaporComponent(block)) {
     return getBlockFirstNode(getComponentPhysicalBlock(block))
   } else {
+    if (isTeleportEnabled && isTeleportFragment(block)) {
+      // teleported content lives in the target container; in the main view
+      // the fragment starts at its placeholder. Both markers are absent while
+      // hydrating and after removal, so fall through to the generic path.
+      const marker = block.placeholder || block.anchor
+      if (marker) return marker
+    }
     const nodes = block.nodes
     // Empty fragments may keep their insertion anchor in `anchor` or in
     // `nodes` (ForFragment).

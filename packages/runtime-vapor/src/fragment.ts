@@ -10,9 +10,12 @@ import {
   isValidBlock,
   isValidSlot,
   remove,
+  removeAttachedNodes,
+  removeNode,
 } from './block'
 import {
   type GenericComponentInstance,
+  type MoveType,
   type SuspenseBoundary,
   type TransitionHooks,
   type VNode,
@@ -24,34 +27,53 @@ import {
 import type { VaporComponentInstance } from './component'
 import type { NodeRef } from './apiTemplateRef'
 import {
+  type HydrationCursor,
   advanceHydrationNode,
+  claimAnchor,
+  claimUntrackedAnchor,
   currentHydrationNode,
-  isComment,
+  exitHydrationCursor,
   isHydrating,
-  locateEndAnchor,
+  locateFragmentEnd,
   locateHydrationNode,
-  markHydrationAnchor,
 } from './dom/hydration'
 import { currentSlotOwner, setCurrentSlotOwner } from './componentSlots'
 import {
+  isSuspenseEnabled,
+  parentSuspense,
+  setParentSuspense,
+} from './suspense'
+import {
+  applyScopeIdOwners,
+  currentSlotScopeIds,
+  setCurrentSlotScopeIds,
+} from './scopeId'
+import {
   type SlotBoundaryContext,
   currentSlotBoundary,
+  hasSlotFallback,
+  registerContentInvalid,
   setCurrentSlotBoundary,
   trackSlotBoundaryDirtying,
   withSlotBoundary,
 } from './slotBoundary'
 import {
+  claimPrecedingFragmentClose,
+  createDeferredSlotAttach,
   getCurrentSlotEndAnchor,
   hydrateDynamicFragmentAnchor,
   prepareDeferredHydrationAnchor,
-  startPendingSlotContent,
+  queuePendingSlotContentAnchor,
+  startPendingSlotContentGuard,
   withHydratingSlotBoundary,
 } from './dom/hydrateFragment'
 import {
   type SlotResolutionState,
   disposeSlotResolution,
+  invalidateExposedSlotContent,
   markSlotResolutionDirty,
   recheckSlotResolution,
+  resolveExposedSlotNodes,
 } from './slotFragment'
 import { setBlockKey } from './helpers/setKey'
 import {
@@ -66,15 +88,25 @@ import {
   isVaporTransition,
   removeBranchWithLeave,
 } from './transition'
+import {
+  DYNAMIC,
+  FOR,
+  FOR_ITEM,
+  FRAGMENT,
+  SLOT,
+  SLOT_FRAGMENT,
+  SLOT_OUTLET,
+  VDOM,
+} from './fragmentFlags'
 
 export class VaporFragment<
   T extends Block = Block,
 > implements TransitionOptions {
   /**
-   * @internal marker for duck typing to avoid direct instanceof check
-   * which prevents tree-shaking of VaporFragment
+   * @internal fragment protocol flags. Role checks use a shared field instead
+   * of class references so unused fragment implementations remain tree-shakable.
    */
-  readonly __vf = true
+  readonly __vf: number
   $key?: any
   $transition?: VaporTransitionHooks | undefined
   nodes: T
@@ -86,6 +118,7 @@ export class VaporFragment<
     anchor: Node | null,
     parentSuspense?: SuspenseBoundary | null,
     transitionHooks?: TransitionHooks,
+    moveType?: MoveType,
   ) => void
   remove?: (parent?: ParentNode, transitionHooks?: TransitionHooks) => void
   hydrate?(...args: any[]): void
@@ -95,17 +128,28 @@ export class VaporFragment<
     refFor: boolean,
     refKey: string | undefined,
   ) => void
+  /**
+   * @internal vdom interop protocol, implemented by interop fragments so
+   * structural features act on VDOM-backed content without reaching into the
+   * backing vnode. `hasVDOMContent` is dynamic: an interop slot fragment
+   * exposing a vapor fallback has no backing vnode at that moment.
+   */
+  hasVDOMContent?: (this: VaporFragment) => boolean
+  /** @internal mirrors a block key onto the backing vnode for keyed paths */
+  setKey?: (this: VaporFragment, key: any) => void
+  /** @internal resolved transition child type of the backing vnode */
+  getTransitionType?: (this: VaporFragment) => any
+  /** @internal live transition element of the backing vnode's subtree */
+  getTransitionElement?: (this: VaporFragment) => Element | undefined
 
   // hooks
-  onBeforeInsert?: ((nodes: Block) => void)[]
-  // Return true to keep the branch scope alive after removing its DOM.
-  onBeforeRemove?: ((scope: EffectScope) => boolean)[]
   onRemove?: (() => void)[]
   onBeforeUpdate?: (() => void)[]
   onUpdated?: ((nodes?: Block) => void)[]
 
-  constructor(nodes: T) {
+  constructor(nodes: T, flags: number = FRAGMENT) {
     this.nodes = nodes
+    this.__vf = flags
   }
 }
 
@@ -124,11 +168,26 @@ export class RenderContextFragment<
   readonly slotOwner: VaporComponentInstance | null = currentSlotOwner
   readonly keepAliveCtx?: VaporKeepAliveContext | null
   readonly slotBoundary: SlotBoundaryContext | null = currentSlotBoundary
+  // The Suspense boundary this fragment renders *into*. Unlike
+  // `renderInstance.suspense` (the boundary its owner was mounted in), slot
+  // content can be declared outside a boundary and rendered inside one, so this
+  // has to be the ambient value at construction time. Restored alongside the
+  // other fragment-owned ambient state in `runWithFragmentCtxOnly`, so
+  // branches that first render during an update queue their post-render
+  // effects on the right boundary instead of the global queue.
+  readonly renderSuspense?: SuspenseBoundary | null
+  // Captured by reference: slot outlets replace this with their merged id cell
+  // right after construction, so late renders (branch switches, deferred
+  // fallbacks) create their DOM under the outlet's slot scope context.
+  slotScopeIds: string[] | null = currentSlotScopeIds
 
-  constructor(nodes: T) {
-    super(nodes)
+  constructor(nodes: T, flags: number = FRAGMENT) {
+    super(nodes, flags)
     if (isKeepAliveEnabled) {
       this.keepAliveCtx = getKeepAliveContext(currentInstance)
+    }
+    if (__FEATURE_SUSPENSE__ && isSuspenseEnabled) {
+      this.renderSuspense = parentSuspense
     }
   }
 
@@ -150,6 +209,30 @@ export function runWithRenderCtx<R>(
   }
 }
 
+/**
+ * The one construction point for a slot host's boundary context, shared by
+ * SlotFragment and both vdom-interop slot hosts. `run` and `getScopeIds`
+ * always come from the host fragment's render seam; `parent`, `getFallback`
+ * and `markDirty` stay host-specific (ownership caps, fallback sources and
+ * dirty batching differ per host).
+ */
+export function createSlotBoundary(
+  fragment: RenderContextFragment,
+  parent: SlotBoundaryContext | null,
+  getFallback: () => BlockFn | undefined,
+  markDirty: (force?: boolean) => void,
+  onContentInvalid?: (() => void)[],
+): SlotBoundaryContext {
+  return {
+    parent,
+    getFallback,
+    run: (fn, scope) => runWithRenderCtx(fragment, fn, scope),
+    getScopeIds: () => fragment.slotScopeIds,
+    markDirty,
+    onContentInvalid,
+  }
+}
+
 // Restores fragment-owned ambient state only. The caller must already have the
 // correct currentInstance / currentScope; use runWithRenderCtx for late renders.
 export function runWithFragmentCtxOnly<R>(
@@ -158,20 +241,32 @@ export function runWithFragmentCtxOnly<R>(
 ): R {
   // When ambient fragment context already matches, no ambient state needs
   // restoring. This keeps ordinary branch renders on the cheap path.
+  const suspense =
+    __FEATURE_SUSPENSE__ && isSuspenseEnabled
+      ? fragment.renderSuspense || null
+      : null
+  const restoreSuspense =
+    __FEATURE_SUSPENSE__ && isSuspenseEnabled && parentSuspense !== suspense
   if (
+    !restoreSuspense &&
     currentSlotOwner === fragment.slotOwner &&
-    currentSlotBoundary === fragment.slotBoundary
+    currentSlotBoundary === fragment.slotBoundary &&
+    currentSlotScopeIds === fragment.slotScopeIds
   ) {
     return fn()
   }
 
+  const prevSuspense = restoreSuspense ? setParentSuspense(suspense) : null
   const prevSlotOwner = setCurrentSlotOwner(fragment.slotOwner)
   const prevBoundary = setCurrentSlotBoundary(fragment.slotBoundary)
+  const prevSlotScopeIds = setCurrentSlotScopeIds(fragment.slotScopeIds)
   try {
     return fn()
   } finally {
+    setCurrentSlotScopeIds(prevSlotScopeIds)
     setCurrentSlotBoundary(prevBoundary)
     setCurrentSlotOwner(prevSlotOwner)
+    if (restoreSuspense) setParentSuspense(prevSuspense)
   }
 }
 
@@ -187,7 +282,7 @@ export class ForFragment extends VaporFragment<Block[]> {
     trackSlotBoundary: boolean,
     onInvalid?: () => void,
   ) {
-    super(nodes)
+    super(nodes, FOR)
     if (trackSlotBoundary) trackSlotBoundaryDirtying(this, onInvalid)
   }
 
@@ -199,9 +294,6 @@ export class ForFragment extends VaporFragment<Block[]> {
 export class ForBlock extends VaporFragment {
   scope: EffectScope | undefined
   key: any
-  prev?: ForBlock
-  next?: ForBlock
-  prevAnchor?: ForBlock
 
   itemRef: ShallowRef<any>
   keyRef: ShallowRef<any> | undefined
@@ -215,7 +307,7 @@ export class ForBlock extends VaporFragment {
     index: ShallowRef<number | undefined> | undefined,
     renderKey: any,
   ) {
-    super(nodes)
+    super(nodes, FOR_ITEM)
     this.scope = scope
     this.itemRef = item
     this.keyRef = key
@@ -225,11 +317,6 @@ export class ForBlock extends VaporFragment {
 }
 
 export class DynamicFragment extends RenderContextFragment {
-  /**
-   * @internal marker for duck typing to avoid direct instanceof check
-   * which prevents tree-shaking of DynamicFragment
-   */
-  readonly __df = true
   // @ts-expect-error - assigned in the constructor or hydrateDynamicFragmentAnchor()
   anchor: Node
   scope: EffectScope | undefined
@@ -237,33 +324,37 @@ export class DynamicFragment extends RenderContextFragment {
   // Owned by the Transition module (deferBranchUpdateDuringLeave /
   // removeBranchWithLeave); the core update pipeline never touches it.
   pending?: { render?: BlockFn; key: any; noScope: boolean }
+  // Debug text for the runtime anchor comment, dev builds only. Never a
+  // category signal: everything hydration branches on lives in `__vf`.
   anchorLabel?: string
   keyed?: boolean
-  // pure marker consumed by the isSlotFragment predicate; the core update
-  // pipeline never reads it.
-  isSlot?: boolean
-  // Hydration-only marker for forwarded slots. They restore their own content
-  // anchor but leave inherited fallback resolution to the receiver slot.
-  forwarded?: boolean
-  // Marks the generic dynamic fragment that createPlainElement creates for the
-  // default-slot children of a dynamic element resolved to a native tag
-  // (`rawSlots.$`). Unlike labeled control-flow fragments it has no
-  // SSR-provided anchor, so hydration injects and then reuses its own runtime
-  // anchor. Hydration logic must branch on this marker, never on
-  // `anchorLabel === ''` — the empty string is only this fragment's (empty)
-  // dev-mode comment text and must not double as a category signal.
-  nativeChildren?: boolean
   inTransition?: boolean
-  // Fallthrough attrs hooks register branch-owned effects on insert.
-  hasFallthroughAttrs?: true
+  // Fallthrough (re-)application for this fragment's branches, installed by
+  // the owning component when the fragment sits on its fallthrough root
+  // chain. Invoked inside the branch render ctx so created effects capture
+  // the correct instance and land in branch scopes; its presence also forces
+  // scopes for compiler-proven no-scope branches.
+  fallthrough?: (nodes: Block) => void
+  // Ancestor instances whose root-only scope ids resolve through this
+  // fragment; branch switches re-apply them to the new root before insertion.
+  scopeIdOwners?: VaporComponentInstance[]
+  // Whether update() ran before. The very first update renders as part of
+  // the mount and must not fire onUpdated hooks; with an adopted template
+  // anchor `parent` is non-null even then, so mount status can no longer be
+  // inferred from the anchor being detached.
+  everUpdated = false
   constructor(
+    // subtype bits only (IF, NATIVE_CHILDREN, SLOT_FRAGMENT...); the class
+    // invariant DYNAMIC is added here so it cannot be forgotten
+    flags: number = 0,
     anchorLabel?: string,
     keyed: boolean = false,
     locate: boolean = true,
     trackSlotBoundary: boolean = false,
     onInvalid?: () => void,
+    adoptAnchor?: Node,
   ) {
-    super(EMPTY_BLOCK)
+    super(EMPTY_BLOCK, DYNAMIC | flags)
     if (keyed) this.keyed = true
     if (
       isTransitionEnabled &&
@@ -272,13 +363,11 @@ export class DynamicFragment extends RenderContextFragment {
     ) {
       this.inTransition = true
     }
+    if (__DEV__) this.anchorLabel = anchorLabel
     if (isHydrating) {
-      this.anchorLabel = anchorLabel
       if (locate) locateHydrationNode()
     } else {
-      this.anchor =
-        __DEV__ && anchorLabel ? createComment(anchorLabel) : createTextNode()
-      if (__DEV__) this.anchorLabel = anchorLabel
+      this.anchor = resolveFragmentAnchor(adoptAnchor, anchorLabel)
     }
     if (trackSlotBoundary) trackSlotBoundaryDirtying(this, onInvalid)
   }
@@ -290,6 +379,8 @@ export class DynamicFragment extends RenderContextFragment {
   }
 
   update(render?: BlockFn, key: any = render, noScope: boolean = false): void {
+    const everUpdated = this.everUpdated
+    this.everUpdated = true
     if (key === this.current) {
       // On initial hydration, `key === current` means `render` is empty,
       // so this fragment hydrates as empty content.
@@ -320,18 +411,17 @@ export class DynamicFragment extends RenderContextFragment {
 
     const prevSub = setActiveSub()
     const parent = !isHydrating ? this.getBranchParent() : null
+    let removePrevious: (() => void) | undefined
     // teardown previous branch
     if (wasMounted) {
       const scope = this.scope
+      const previous = this.nodes
+      const removeBranch = () => remove(previous, parent || undefined)
+      let deferRemoval = false
       if (scope) {
-        let retainScope = false
-        const onBeforeRemove = this.onBeforeRemove
-        if (onBeforeRemove) {
-          for (let i = 0; i < onBeforeRemove.length; i++) {
-            retainScope = onBeforeRemove[i](scope) || retainScope
-          }
-        }
-        if (!retainScope) {
+        if (this.keepAliveCtx) {
+          deferRemoval = this.keepAliveCtx.prepareBranchRemoval(this, scope)
+        } else {
           scope.stop()
         }
       }
@@ -343,7 +433,11 @@ export class DynamicFragment extends RenderContextFragment {
         setActiveSub(prevSub)
         return
       }
-      remove(this.nodes, parent || undefined)
+      if (deferRemoval) {
+        removePrevious = removeBranch
+      } else {
+        removeBranch()
+      }
     }
 
     const reusingDeferredAnchor = isHydrating
@@ -356,7 +450,10 @@ export class DynamicFragment extends RenderContextFragment {
       parent,
       key,
       noScope,
-      wasMounted || !!parent,
+      // notify on any update except the mount-time first render; see the
+      // `everUpdated` field comment
+      wasMounted || (everUpdated && !!parent),
+      removePrevious,
     )
     setActiveSub(prevSub)
 
@@ -376,44 +473,41 @@ export class DynamicFragment extends RenderContextFragment {
     transition: VaporTransitionHooks | undefined,
     parent: ParentNode | null,
     key: any,
-    noScope: boolean = false,
-    notifyUpdated: boolean = !!parent,
+    noScope: boolean,
+    notifyUpdated: boolean,
+    removePrevious?: () => void,
   ): void {
     this.current = key
     if (render) {
       const keepAliveCtx = isKeepAliveEnabled ? this.keepAliveCtx : null
       // A compiler-proven static branch can skip its own EffectScope, but attrs
       // fallthrough still registers branch-owned cleanup.
-      const useScope = !noScope || !!this.hasFallthroughAttrs
-      if (useScope) {
-        // try to reuse the kept-alive scope
-        const scope =
-          keepAliveCtx && keepAliveCtx.acquireBranchScope(this.current)
-        if (scope) {
-          this.scope = scope
-        } else {
-          this.scope = new EffectScope()
-        }
-      } else {
-        this.scope = undefined
+      const useScope = !noScope || !!this.fallthrough
+      if (!keepAliveCtx) {
+        this.scope = useScope ? new EffectScope() : undefined
       }
 
       const renderBranch = () => {
         try {
-          this.nodes = this.runWithRenderCtx(
-            () =>
-              (useScope ? this.scope!.run(render) : render()) || EMPTY_BLOCK,
-            this.scope,
-          )
+          this.nodes = this.runWithRenderCtx(() => {
+            const nodes =
+              (useScope ? this.scope!.run(render) : render()) || EMPTY_BLOCK
+            // (Re-)apply fallthrough attrs for the new branch inside the
+            // render ctx, before insertion. Disconnected renders are skipped
+            // on purpose: the enclosing application traverses into them and
+            // owns their first application.
+            if (parent && this.fallthrough) this.fallthrough(nodes)
+            return nodes
+          }, this.scope)
         } finally {
-          // propagate the fragment key onto freshly rendered nodes.
+          // Inherit the fragment key without overriding a child's own key.
           const key = this.keyed ? this.current : this.$key
           // Only propagate branch keys when Transition or KeepAlive consumes them.
           if (
             key !== undefined &&
             (transition || this.inTransition || keepAliveCtx)
           ) {
-            setBlockKey(this.nodes, key)
+            setBlockKey(this.nodes, key, false)
           }
 
           if (isTransitionEnabled && transition) {
@@ -423,19 +517,29 @@ export class DynamicFragment extends RenderContextFragment {
       }
 
       keepAliveCtx
-        ? keepAliveCtx.runBranchRender(this, renderBranch)
+        ? keepAliveCtx.runBranchRender(
+            this,
+            renderBranch,
+            useScope,
+            removePrevious,
+          )
         : renderBranch()
 
+      // Root-only inherited ids must land on the new branch's effective root
+      // before insertion so custom element callbacks observe them.
+      if (this.scopeIdOwners) applyScopeIdOwners(this.scopeIdOwners)
+
       if (parent) {
-        const onBeforeInsert = this.onBeforeInsert
-        if (onBeforeInsert) {
-          onBeforeInsert.forEach(hook => hook(this.nodes))
-        }
         insert(this.nodes, parent, this.anchor)
+        if (removePrevious && keepAliveCtx) {
+          // Publish the new cache entry only after it has been mounted.
+          keepAliveCtx.cacheBlock(this)
+        }
       }
     } else {
       this.scope = undefined
       this.nodes = EMPTY_BLOCK
+      if (removePrevious) removePrevious()
     }
 
     const onUpdated = this.onUpdated
@@ -453,9 +557,7 @@ export class SlotFragment
   extends DynamicFragment
   implements SlotResolutionState
 {
-  isSlot = true
   private disposed = false
-  forwarded = false
   // Custom elements with `shadowRoot: false` replace their native slot outlet
   // after mount. Keep the live fallback block on the fragment so CE slot sync
   // can preserve block ownership after the outlet node is gone.
@@ -466,15 +568,48 @@ export class SlotFragment
   lastNodesValid?: boolean
   pendingRecheck = false
   pendingRecheckForce = false
-  isRenderingFallback = false
+  isReconciling = false
   private readonly onContentInvalid: (() => void)[] = []
   private content: Block = EMPTY_BLOCK
   private localFallback?: BlockFn
   private isUpdating = false
   private ownBoundary?: SlotBoundaryContext
   // Slot-root outlets expose their content validity to the enclosing boundary.
-  constructor(private readonly notifyParentBoundary: boolean = false) {
-    super(isHydrating || __DEV__ ? 'slot' : undefined, false, false, false)
+  constructor(
+    private readonly notifyParentBoundary: boolean = false,
+    private readonly sharedFallback: boolean = false,
+    private readonly inheritFallback: boolean = false,
+    adoptAnchor?: Node,
+  ) {
+    super(
+      SLOT_FRAGMENT,
+      __DEV__ ? 'slot' : undefined,
+      false,
+      false,
+      false,
+      undefined,
+      adoptAnchor,
+    )
+    if (sharedFallback) {
+      if (this.slotBoundary) {
+        registerContentInvalid(
+          this.slotBoundary,
+          () => {
+            invalidateExposedSlotContent(this)
+            const anchor = this.anchor
+            const parent = anchor.parentNode
+            if (parent) {
+              removeAttachedNodes(this.content, parent)
+              if (this.activeFallback) {
+                removeAttachedNodes(this.activeFallback, parent)
+              }
+              removeNode(anchor, parent)
+            }
+          },
+          this,
+        )
+      }
+    }
     if (!isHydrating) {
       this.insert = (parent, anchor, parentSuspense) =>
         this.insertSlot(parent, anchor, parentSuspense)
@@ -488,13 +623,13 @@ export class SlotFragment
   }
 
   get boundary(): SlotBoundaryContext {
-    return (this.ownBoundary ||= {
-      parent: this.slotBoundary,
-      getFallback: () => this.localFallback,
-      run: (fn, scope) => this.runWithRenderCtx(fn, scope),
-      markDirty: force => markSlotResolutionDirty(this, force),
-      onContentInvalid: this.onContentInvalid,
-    })
+    return (this.ownBoundary ||= createSlotBoundary(
+      this,
+      this.inheritFallback ? this.slotBoundary : null,
+      () => this.localFallback,
+      force => markSlotResolutionDirty(this, force),
+      this.onContentInvalid,
+    ))
   }
 
   private insertSlot(
@@ -549,20 +684,17 @@ export class SlotFragment
     key: any,
   ): { contentStart: Node | null; contentValid: boolean } {
     const contentStart = currentHydrationNode
-    let finish: ((contentValid: boolean) => void) | null = null
+    const pending = startPendingSlotContentGuard(
+      this.sharedFallback || hasSlotFallback(this.boundary),
+      contentStart,
+    )
     try {
-      finish = startPendingSlotContent(contentStart)
       this.updateContent(render, key)
       const contentValid = isValidSlot(this.content)
-      if (finish) {
-        finish(contentValid)
-        finish = null
-      }
+      pending.finish(contentValid)
       return { contentStart, contentValid }
     } finally {
-      if (finish) {
-        finish(true)
-      }
+      pending.settle()
     }
   }
 
@@ -583,33 +715,71 @@ export class SlotFragment
     try {
       const shouldForce = prevLocalFallback !== fallback
       if (isHydrating) {
-        // Forwarded content without local fallback must not run inherited
-        // fallback resolution itself. It only restores its own content anchor;
-        // the receiver slot boundary decides whether inherited fallback
-        // should run.
-        if (this.forwarded && !fallback) {
+        // Forwarded roots that do not own an inherited fallback restore only
+        // their exposed branch. The receiver decides its fallback after all
+        // shared roots have reported their final content/local-fallback result.
+        if (this.sharedFallback || (this.inheritFallback && !fallback)) {
           const { contentStart, contentValid } = this.updateHydratingContent(
             slotRender,
             key,
           )
-          this.syncNodes()
-          this.lastNodesValid = contentValid
-          if (contentValid) {
-            const end =
-              contentStart && isComment(contentStart, '[')
-                ? locateEndAnchor(contentStart)
-                : null
+          const end = locateFragmentEnd(contentStart)
+          let exposedValid = contentValid
+          if (this.sharedFallback) {
+            recheckSlotResolution(this, shouldForce || this.pendingRecheckForce)
+            exposedValid = isValidSlot(this.nodes)
+          } else {
+            this.syncNodes()
+            this.lastNodesValid = contentValid
+          }
+          if (exposedValid) {
             if (end) {
-              this.anchor = markHydrationAnchor(end)
+              this.anchor = claimAnchor(end)
               advanceHydrationNode(end)
             } else {
-              hydrateDynamicFragmentAnchor(this, !isValidBlock(this.content))
+              hydrateDynamicFragmentAnchor(this, !isValidBlock(this.nodes))
+            }
+          } else if (this.sharedFallback) {
+            const slotEnd = getCurrentSlotEndAnchor()
+            const candidate = end && end !== slotEnd ? end : null
+            if (candidate) {
+              // Move past this candidate range so later sibling roots hydrate
+              // from their own position. The parent aggregate decision below
+              // determines whether this root actually owns the range.
+              advanceHydrationNode(candidate)
+            }
+            const anchor = claimUntrackedAnchor(
+              __DEV__
+                ? createComment(this.anchorLabel ?? '')
+                : createTextNode(),
+            )
+            this.anchor = anchor
+            claimPrecedingFragmentClose(slotEnd)
+            const attachContent = createDeferredSlotAttach(
+              contentStart,
+              slotEnd,
+              anchor,
+              candidate,
+              candidate => (this.anchor = claimAnchor(candidate)),
+              () => this.nodes,
+            )
+            // Post-flush even after the verdict: the reference node's final
+            // position is only stable once the whole pass has finished.
+            const queued = queuePendingSlotContentAnchor({
+              onContent: attachContent,
+              onFallback: () => {},
+            })
+            if (!queued) {
+              if (candidate) {
+                claimAnchor(candidate)
+              }
+              queuePostFlushCb(attachContent)
             }
           } else {
-            // Empty forwarded content should not claim the receiver slot's SSR
-            // close marker. Queue its runtime anchor before that marker so
+            // Empty forwarded content should not claim the receiver slot's
+            // SSR close marker. Queue its runtime anchor before that marker so
             // fallback hydration can finish first and the final DOM matches CSR.
-            const anchor = (this.anchor = markHydrationAnchor(
+            const anchor = (this.anchor = claimUntrackedAnchor(
               __DEV__
                 ? createComment(this.anchorLabel ?? '')
                 : createTextNode(),
@@ -617,15 +787,10 @@ export class SlotFragment
             const slotEnd = getCurrentSlotEndAnchor()
             const parent = slotEnd && slotEnd.parentNode
             if (parent) {
-              const previous = slotEnd.previousSibling
-              if (previous && isComment(previous, ']')) {
-                // When the receiver fallback is a fragment, the node right
-                // before the receiver slot end is the fallback fragment's SSR
-                // close. This forwarded slot does not own that marker, but
-                // boundary cleanup runs before the queued anchor is inserted,
-                // so mark it now.
-                markHydrationAnchor(previous)
-              }
+              // When the receiver fallback is a fragment, the node right
+              // before the receiver slot end is the fallback fragment's SSR
+              // close.
+              claimPrecedingFragmentClose(slotEnd)
 
               queuePostFlushCb(() => {
                 if (slotEnd.parentNode === parent) {
@@ -677,7 +842,7 @@ export class SlotFragment
   }
 
   syncNodes(): void {
-    this.nodes = this.activeFallback || this.content
+    this.nodes = resolveExposedSlotNodes(this)
   }
 
   notifyExposedValidityChange(): void {
@@ -687,30 +852,108 @@ export class SlotFragment
   }
 }
 
+/**
+ * Adopt the template `<!>` placeholder passed through the insertion state as
+ * the fragment anchor instead of creating (and later inserting) a runtime
+ * anchor. Restricted to comments: adopting any other node would remove user
+ * DOM on removeFragment. Callers detect adoption by identity: the returned
+ * node is the adopted anchor iff it equals the passed one.
+ */
+export function resolveFragmentAnchor(
+  adopt: Node | undefined,
+  anchorLabel: string | undefined,
+): Node {
+  if (adopt && adopt.nodeType === 8 /* Comment */) {
+    if (__DEV__ && anchorLabel) (adopt as Comment).data = anchorLabel
+    return claimUntrackedAnchor(adopt)
+  }
+  return claimUntrackedAnchor(
+    __DEV__ && anchorLabel ? createComment(anchorLabel) : createTextNode(),
+  )
+}
+
+/**
+ * Whether a fragment adopted the captured insertion anchor — the template
+ * `<!>` placeholder — as its own, which means it rendered in place and the
+ * creator must skip its trailing insert. Unrelated to hydration's
+ * `isClaimedAnchor` / `skipUntrackedAnchors`, which are about anchor nodes
+ * marked during a hydration pass.
+ *
+ * The insertion anchor must be checked non-null: append inserts capture no
+ * anchor, and fragments without a client anchor (vdom interop slots, any
+ * fragment during hydration) would otherwise compare undefined === undefined
+ * and falsely skip their only insertion.
+ */
+export function isAdoptedPlaceholder(
+  fragmentAnchor: Node | undefined,
+  insertionAnchor: Node | undefined,
+): boolean {
+  return !!insertionAnchor && fragmentAnchor === insertionAnchor
+}
+
+/**
+ * Shared tail for every block-creating API (`createIf`, `createFor`,
+ * `createKeyedFragment`, `createDynamicComponent`, slot outlets): the block is
+ * built, now hand it over to the scope that asked for it.
+ *
+ * Client render: insert it at the captured insertion point, unless it adopted
+ * that point's `<!>` placeholder as its own anchor and therefore already
+ * rendered in place. Hydration: there is nothing to insert — the block adopted
+ * server nodes where they already stood — so hand back the cursor instead.
+ *
+ * Site-specific hydration work (claiming a leftover `<!---->`, advancing past
+ * an anchor, running an interop fragment's `hydrate()`) belongs *before* this
+ * call, guarded by `isHydrating`; keeping it out of here avoids allocating a
+ * callback on the client-render path, which never needs one.
+ */
+export function finishBlockCreation(
+  block: Block,
+  anchor: Node | undefined,
+  cursor: HydrationCursor | null,
+  insertionParent: ParentNode | undefined,
+  insertionAnchor: Node | undefined,
+  /** force insertion even when the anchor was adopted (custom element slots) */
+  force?: boolean,
+): void {
+  if (isHydrating) {
+    exitHydrationCursor(cursor)
+  } else if (
+    insertionParent &&
+    (force || !isAdoptedPlaceholder(anchor, insertionAnchor))
+  ) {
+    insert(block, insertionParent, insertionAnchor)
+  }
+}
+
 export function isFragment(val: unknown): val is VaporFragment {
   return !!(val && (val as any).__vf)
 }
 
-export type InteropFragment<T extends Block = Block> = VaporFragment<T> & {
-  vnode: VNode | null
-}
+export type InteropFragment<T extends Block = Block> =
+  RenderContextFragment<T> & {
+    vnode: VNode | null
+  }
 
 export function isInteropFragment(val: unknown): val is InteropFragment {
-  return isFragment(val) && val.vnode !== undefined
+  return !!(val && (val as any).__vf & VDOM)
+}
+
+export function isSlotOutletFragment(val: unknown): boolean {
+  return !!(val && (val as any).__vf & SLOT_OUTLET)
 }
 
 export function isDynamicFragment(val: unknown): val is DynamicFragment {
-  return !!(val && (val as any).__df)
+  return !!(val && (val as any).__vf & DYNAMIC)
 }
 
 export function isForFragment(val: unknown): val is ForFragment {
-  return isFragment(val) && typeof (val as ForFragment).onReset === 'function'
+  return !!(val && (val as any).__vf & FOR)
 }
 
 export function isForBlock(val: unknown): val is ForBlock {
-  return isFragment(val) && (val as ForBlock).itemRef !== undefined
+  return !!(val && (val as any).__vf & FOR_ITEM)
 }
 
 export function isSlotFragment(val: unknown): val is SlotFragment {
-  return isDynamicFragment(val) && !!val.isSlot
+  return !!(val && (val as any).__vf & SLOT)
 }

@@ -6,10 +6,12 @@ import {
   withModifiers,
 } from '@vue/runtime-dom'
 import {
+  VaporKeepAlive,
   VaporTeleport,
   createComponent,
   createDynamicComponent,
   createIf,
+  createKeyedFragment,
   createSlot,
   defineVaporComponent,
   delegateEvents,
@@ -22,7 +24,12 @@ import {
   template,
 } from '../src'
 import { compile, makeRender } from './_utils'
-import { VaporDynamicComponentFlags, stringifyStyle } from '@vue/shared'
+import {
+  VaporBlockShape,
+  VaporDynamicComponentFlags,
+  VaporIfFlags,
+  stringifyStyle,
+} from '@vue/shared'
 import { setElementText } from '../src/dom/prop'
 
 const define = makeRender<any>()
@@ -1525,5 +1532,646 @@ describe('attribute fallthrough', () => {
 
     const el = host.children[0]
     expect(el.classList.length).toBe(0)
+  })
+
+  it('passes v-text to components as a reactive textContent prop', async () => {
+    const value = ref('<b>one</b>')
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps(['textContent'])
+      </script>
+      <template><div>prop:{{ props.textContent }}</div></template>`,
+      ref(null),
+    )
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      value,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div>prop:&lt;b&gt;one&lt;/b&gt;</div>')
+
+    value.value = '<i>two</i>'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div>prop:&lt;i&gt;two&lt;/i&gt;</div>')
+  })
+
+  it('passes v-html to components as a reactive innerHTML prop', async () => {
+    const value = ref('<b>one</b>')
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps(['innerHTML'])
+      </script>
+      <template><div>prop:{{ props.innerHTML }}</div></template>`,
+      ref(null),
+    )
+    const Parent = compile(
+      `<template><components.Child v-html="data" /></template>`,
+      value,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div>prop:&lt;b&gt;one&lt;/b&gt;</div>')
+
+    value.value = '<i>two</i>'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div>prop:&lt;i&gt;two&lt;/i&gt;</div>')
+  })
+
+  it('warns when v-text cannot fall through to a text root', () => {
+    const Child = compile(`<template>child</template>`, ref(null))
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      ref('foo'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    expect(`Extraneous non-props attributes (textContent)`).toHaveBeenWarned()
+  })
+
+  it('warns when v-html cannot fall through to a text root', () => {
+    const Child = compile(`<template>child</template>`, ref(null))
+    const Parent = compile(
+      `<template><components.Child v-html="data" /></template>`,
+      ref('<b>foo</b>'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    expect(`Extraneous non-props attributes (innerHTML)`).toHaveBeenWarned()
+  })
+
+  it('does not warn for filtered functional fallthrough on a text root', () => {
+    const { component: Child } = define(() => template('child')())
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      ref('foo'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    expect(`Extraneous non-props attributes`).not.toHaveBeenWarned()
+  })
+
+  it('warns for unfiltered functional fallthrough on a text root when props are declared', () => {
+    const { component: Child } = define(() => template('child')())
+    Child.props = ['foo']
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      ref('foo'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    // a functional component with declared props receives full fallthrough,
+    // and a text root cannot accept it — align with vdom's warning
+    expect(`Extraneous non-props attributes`).toHaveBeenWarned()
+  })
+
+  it('applies v-text fallthrough after switching dynamic components', async () => {
+    const state = ref({ current: 'A', content: '<b>one</b>' })
+    const A = compile(`<template><div>A</div></template>`, ref(null))
+    const B = compile(`<template><div>B</div></template>`, ref(null))
+    const Parent = compile(
+      `<template>
+        <component
+          :is="components[data.current]"
+          v-text="data.content"
+        />
+      </template>`,
+      state,
+      { A, B },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe(
+      '<div>&lt;b&gt;one&lt;/b&gt;</div><!--dynamic-component-->',
+    )
+
+    state.value = { ...state.value, current: 'B' }
+    await nextTick()
+    expect(host.innerHTML).toBe(
+      '<div>&lt;b&gt;one&lt;/b&gt;</div><!--dynamic-component-->',
+    )
+
+    state.value = { ...state.value, content: '<i>two</i>' }
+    await nextTick()
+    expect(host.innerHTML).toBe(
+      '<div>&lt;i&gt;two&lt;/i&gt;</div><!--dynamic-component-->',
+    )
+  })
+
+  it('applies v-html fallthrough after switching dynamic components', async () => {
+    const state = ref({ current: 'A', content: '<b>one</b>' })
+    const A = compile(`<template><div>A</div></template>`, ref(null))
+    const B = compile(`<template><div>B</div></template>`, ref(null))
+    const Parent = compile(
+      `<template>
+        <component
+          :is="components[data.current]"
+          v-html="data.content"
+        />
+      </template>`,
+      state,
+      { A, B },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div><b>one</b></div><!--dynamic-component-->')
+
+    state.value = { ...state.value, current: 'B' }
+    await nextTick()
+    expect(host.innerHTML).toBe('<div><b>one</b></div><!--dynamic-component-->')
+
+    state.value = { ...state.value, content: '<i>two</i>' }
+    await nextTick()
+    expect(host.innerHTML).toBe('<div><i>two</i></div><!--dynamic-component-->')
+  })
+
+  // #15277
+  it('should pass fallthrough attrs to declared props with inheritAttrs: false', () => {
+    const Child = compile(
+      `<script setup vapor>
+        const { class: className } = defineProps({ class: String })
+        defineOptions({ inheritAttrs: false })
+      </script>
+      <template>
+        <div :class="className">class prop = {{ className ?? 'DROPPED' }}</div>
+      </template>`,
+      ref(null),
+    )
+    const Middle = compile(
+      `<template><components.Child /></template>`,
+      ref(null),
+      { Child },
+    )
+    const App = compile(
+      `<template><components.Middle class="forwarded-marker" /></template>`,
+      ref(null),
+      { Middle },
+    )
+
+    const { host } = define(App).render()
+    expect(host.innerHTML).toBe(
+      '<div class="forwarded-marker">class prop = forwarded-marker</div>',
+    )
+  })
+
+  it('should not pass attrs through a component with inheritAttrs: false', () => {
+    const Child = compile(
+      `<script setup vapor>
+        const { class: className } = defineProps({ class: String })
+      </script>
+      <template>
+        <div :class="className">class prop = {{ className ?? 'DROPPED' }}</div>
+      </template>`,
+      ref(null),
+    )
+    const Middle = compile(
+      `<script setup vapor>
+        const Child = _components.Child
+        defineOptions({ inheritAttrs: false })
+      </script>
+      <template><Child /></template>`,
+      ref(null),
+      { Child },
+    )
+    const App = compile(
+      `<template><components.Middle class="forwarded-marker" /></template>`,
+      ref(null),
+      { Middle },
+    )
+
+    const { host } = define(App).render()
+    expect(host.innerHTML).toBe('<div>class prop = DROPPED</div>')
+  })
+
+  it('should apply dynamic attrs that appear after mount', async () => {
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return t0()
+      },
+    })
+
+    const attrs = ref<Record<string, any>>({})
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { $: [() => attrs.value] }, null, true)
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<div></div>')
+
+    attrs.value = { id: 'late' }
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="late"></div>')
+
+    attrs.value = {}
+    await nextTick()
+    expect(host.innerHTML).toBe('<div></div>')
+  })
+
+  it('should clean up functional fallthrough when allowed keys are removed', async () => {
+    const attrs = ref<Record<string, any>>({ class: 'foo' })
+    const Fn = () => template('<div>', 1)()
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Fn as any,
+          { $: [() => attrs.value] },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.className).toBe('foo')
+
+    // class removed; id is not a functional fallthrough key, so the
+    // resolved fallthrough set becomes empty and must still diff away
+    // the previously applied class
+    attrs.value = { id: 'x' }
+    await nextTick()
+    expect(node.className).toBe('')
+    expect(node.getAttribute('id')).toBe(null)
+  })
+
+  it('should filter functional fallthrough forwarded to a component root', () => {
+    const t0 = template('<div>', 1)
+    const { component: Inner } = define({
+      setup() {
+        return t0()
+      },
+    })
+    const Fn = () => createComponent(Inner, null, null, true)
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Fn as any,
+          { id: () => 'x', class: () => 'c' },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.getAttribute('class')).toBe('c')
+    expect(node.getAttribute('id')).toBe(null)
+  })
+
+  it('should not fallthrough v-model listeners with a declared prop', () => {
+    const declared = vi.fn()
+    const undeclared = vi.fn()
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      props: ['foo'],
+      setup() {
+        return t0()
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            'onUpdate:foo': () => declared,
+            'onUpdate:bar': () => undeclared,
+            id: () => 'x',
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.getAttribute('id')).toBe('x')
+    node.dispatchEvent(new CustomEvent('update:foo'))
+    expect(declared).not.toHaveBeenCalled()
+    node.dispatchEvent(new CustomEvent('update:bar'))
+    expect(undeclared).toHaveBeenCalled()
+  })
+
+  it('should not forward declared v-model listeners into a component root', () => {
+    const handler = vi.fn()
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return t0()
+      },
+    })
+    const { component: Middle } = define({
+      props: ['foo'],
+      setup() {
+        return createComponent(Child, null, null, true)
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Middle,
+          {
+            'onUpdate:foo': () => handler,
+            id: () => 'x',
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.getAttribute('id')).toBe('x')
+    node.dispatchEvent(new CustomEvent('update:foo'))
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it('should stop updating fallthrough attrs on a root detached by branch switch', async () => {
+    const show = ref(true)
+    const id = ref('a')
+    const t0 = template('<div>foo</div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return createIf(
+          () => show.value,
+          () => t0(),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+
+    const initialRoot = host.querySelector('div')!
+    expect(initialRoot.getAttribute('id')).toBe('a')
+
+    show.value = false
+    await nextTick()
+    expect(initialRoot.isConnected).toBe(false)
+
+    id.value = 'b'
+    await nextTick()
+    // the branch scope owns the effect, so the detached root is not updated
+    expect(initialRoot.getAttribute('id')).toBe('a')
+
+    show.value = true
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="b">foo</div><!--if-->')
+  })
+
+  it('should stop updating fallthrough attrs on a detached nested branch root', async () => {
+    const outer = ref(true)
+    const inner = ref(true)
+    const id = ref('a')
+    const t0 = template('<div>outer</div>', 1)
+    const t1 = template('<p>inner</p>', 1)
+    const t2 = template('<span>inner-else</span>', 1)
+    const { component: Child } = define({
+      setup() {
+        return createIf(
+          () => outer.value,
+          () => t0(),
+          () =>
+            createIf(
+              () => inner.value,
+              () => t1(),
+              () => t2(),
+            ),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+
+    outer.value = false
+    await nextTick()
+    const innerEl = host.querySelector('p')!
+    expect(innerEl.getAttribute('id')).toBe('a')
+
+    // switching only the inner branch stops the inner branch scope, which
+    // owns the effect for the inner root
+    inner.value = false
+    await nextTick()
+    expect(innerEl.isConnected).toBe(false)
+
+    id.value = 'b'
+    await nextTick()
+    expect(innerEl.getAttribute('id')).toBe('a')
+    expect(host.querySelector('span')!.getAttribute('id')).toBe('b')
+  })
+
+  it('should scope fallthrough for no-scope nested branch roots', async () => {
+    const outer = ref(true)
+    const inner = ref(true)
+    const id = ref('a')
+    const t0 = template('<div>outer</div>', 1)
+    const t1 = template('<p>inner</p>', 1)
+    const t2 = template('<span>inner-else</span>', 1)
+    const noScopeIfElse =
+      VaporBlockShape.SINGLE_ROOT |
+      (VaporBlockShape.SINGLE_ROOT << 2) |
+      VaporIfFlags.TRUE_NO_SCOPE |
+      VaporIfFlags.FALSE_NO_SCOPE
+    const { component: Child } = define({
+      setup() {
+        return createIf(
+          () => outer.value,
+          () => t0(),
+          () =>
+            createIf(
+              () => inner.value,
+              () => t1(),
+              () => t2(),
+              noScopeIfElse,
+            ),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+
+    outer.value = false
+    await nextTick()
+    const innerEl = host.querySelector('p')!
+    expect(innerEl.getAttribute('id')).toBe('a')
+
+    // the no-scope inner branch received a retrofitted scope owning the
+    // effect; switching it stops that scope
+    inner.value = false
+    await nextTick()
+    expect(innerEl.isConnected).toBe(false)
+    id.value = 'b'
+    await nextTick()
+    expect(innerEl.getAttribute('id')).toBe('a')
+    const spanEl = host.querySelector('span')!
+    expect(spanEl.getAttribute('id')).toBe('b')
+
+    // switching the outer branch tears the nested chain down with it
+    outer.value = true
+    await nextTick()
+    expect(spanEl.isConnected).toBe(false)
+    id.value = 'c'
+    await nextTick()
+    expect(spanEl.getAttribute('id')).toBe('b')
+    expect(host.querySelector('div')!.getAttribute('id')).toBe('c')
+  })
+
+  it('should reapply fallthrough attrs across keyed root re-renders', async () => {
+    const key = ref(0)
+    const id = ref('a')
+    const t0 = template('<div>keyed</div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return createKeyedFragment(
+          () => key.value,
+          () => t0(),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+    const first = host.querySelector('div')!
+    expect(first.getAttribute('id')).toBe('a')
+
+    key.value++
+    await nextTick()
+    const second = host.querySelector('div')!
+    expect(second).not.toBe(first)
+    expect(second.getAttribute('id')).toBe('a')
+
+    id.value = 'b'
+    await nextTick()
+    expect(second.getAttribute('id')).toBe('b')
+    // the replaced root's effect died with its branch scope
+    expect(first.getAttribute('id')).toBe('a')
+  })
+
+  it('should allow all attrs on a bare functional component with declared props', async () => {
+    const Fn = ((props: any) => {
+      const n0 = template('<div>', 1)() as Element
+      renderEffect(() => setElementText(n0, props.foo))
+      return n0
+    }) as any
+    Fn.props = ['foo']
+
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Fn,
+          { foo: () => 1, id: () => id.value },
+          null,
+          true,
+        )
+      },
+    }).render()
+
+    const node = host.children[0] as HTMLElement
+    // vdom: a functional component that declares props receives full
+    // fallthrough, not just the class/style/listener whitelist
+    expect(node.getAttribute('id')).toBe('a')
+    expect(node.getAttribute('foo')).toBe(null) // declared prop
+    expect(node.textContent).toBe('1')
+
+    id.value = 'b'
+    await nextTick()
+    expect(node.getAttribute('id')).toBe('b')
+  })
+
+  it('should freeze fallthrough on KeepAlive-cached components and catch up on reactivation', async () => {
+    const current = ref('one')
+    const id = ref('a')
+    const One = defineVaporComponent({
+      name: 'One',
+      setup() {
+        return template('<div>one</div>', 1)()
+      },
+    })
+    const Two = defineVaporComponent({
+      name: 'Two',
+      setup() {
+        return template('<span>two</span>', 1)()
+      },
+    })
+    const views: Record<string, any> = { one: One, two: Two }
+    const { host } = define({
+      setup() {
+        return createComponent(VaporKeepAlive as any, null, {
+          default: () =>
+            createDynamicComponent(() => views[current.value], {
+              id: () => id.value,
+            }),
+        })
+      },
+    }).render()
+
+    const oneEl = host.querySelector('div')!
+    expect(oneEl.getAttribute('id')).toBe('a')
+
+    current.value = 'two'
+    await nextTick()
+    expect(oneEl.isConnected).toBe(false)
+
+    id.value = 'b'
+    await nextTick()
+    // cached: committed inputs are frozen, the cached root must not update
+    expect(oneEl.getAttribute('id')).toBe('a')
+    expect(host.querySelector('span')!.getAttribute('id')).toBe('b')
+
+    current.value = 'one'
+    await nextTick()
+    // reactivated: committed inputs resume and the effect catches up
+    expect(oneEl.isConnected).toBe(true)
+    expect(oneEl.getAttribute('id')).toBe('b')
+  })
+
+  it('should not inherit attrs into a dynamic branch inside slot content', async () => {
+    const show = ref(true)
+    const Child = compile(`<template><slot /></template>`, ref(null))
+    const Middle = compile(
+      `<script setup vapor>
+        const Child = _components.Child
+        const show = _data
+      </script>
+      <template>
+        <Child>
+          <div v-if="show">if</div>
+          <span v-else>else</span>
+        </Child>
+      </template>`,
+      show,
+      { Child },
+    )
+    const App = compile(
+      `<template><components.Middle class="parent" /></template>`,
+      ref(null),
+      { Middle },
+    )
+
+    const { host } = define(App).render()
+    // a slot outlet root cannot receive fallthrough attrs
+    expect(host.querySelector('div')!.className).toBe('')
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarnedTimes(1)
+
+    // the slot boundary still holds after the inner branch switches
+    show.value = false
+    await nextTick()
+    expect(host.querySelector('span')!.className).toBe('')
   })
 })

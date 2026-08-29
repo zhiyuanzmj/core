@@ -1,12 +1,16 @@
 import {
   EMPTY_ARR,
+  EMPTY_OBJ,
   NO,
   camelize,
   hasOwn,
   isArray,
   isFunction,
+  isObject,
   isPlainObject,
   isString,
+  normalizeClass,
+  normalizeStyle,
 } from '@vue/shared'
 import type { VaporComponent, VaporComponentInstance } from './component'
 import {
@@ -28,7 +32,9 @@ import {
   type ComputedRef,
   ReactiveFlags,
   computed,
+  getCurrentScope,
   onScopeDispose,
+  shallowReactive,
 } from '@vue/reactivity'
 import { normalizeEmitsOptions } from './componentEmits'
 import { renderEffect } from './renderEffect'
@@ -43,6 +49,138 @@ export type RawProps = Record<string, unknown> & {
 export type DynamicPropsSource =
   | (() => Record<string, unknown>)
   | Record<string, unknown>
+
+export function isolatePropSources(rawProps: RawProps): RawProps {
+  // Static values cannot change while cached and need no commit boundary.
+  let hasFunctionSource = false
+  for (const key in rawProps) {
+    if (key !== '$' && isFunction(rawProps[key])) hasFunctionSource = true
+  }
+  const dynamicSources = rawProps.$
+  if (dynamicSources && !hasFunctionSource) {
+    for (let i = 0; i < dynamicSources.length; i++) {
+      const source = dynamicSources[i]
+      if (isFunction(source)) {
+        hasFunctionSource = true
+        break
+      } else {
+        for (const key in source) {
+          if (isFunction(source[key])) {
+            hasFunctionSource = true
+            break
+          }
+        }
+        if (hasFunctionSource) break
+      }
+    }
+  }
+  if (!hasFunctionSource) return rawProps
+
+  const isolated: RawProps = Object.create(null)
+  let committed: Record<string, unknown> | undefined
+  for (const key in rawProps) {
+    if (key === '$') continue
+    const source = rawProps[key]
+    if (isFunction(source)) {
+      const target =
+        committed || (committed = shallowReactive<Record<string, unknown>>({}))
+      isolated[key] = () => target[key]
+    } else {
+      isolated[key] = source
+    }
+  }
+
+  let committedDynamicSources:
+    | (Record<string, unknown> | undefined)[]
+    | undefined
+  let previousDynamicSources: Record<string, unknown>[] | undefined
+  if (dynamicSources) {
+    const isolatedDynamicSources: DynamicPropsSource[] & {
+      [interopKey]?: boolean
+    } = []
+    committedDynamicSources = []
+    previousDynamicSources = []
+    for (let i = 0; i < dynamicSources.length; i++) {
+      const source = dynamicSources[i]
+      if (isFunction(source)) {
+        const target = (committedDynamicSources[i] = shallowReactive<
+          Record<string, unknown>
+        >({}))
+        previousDynamicSources[i] = {}
+        isolatedDynamicSources[i] = () => target
+      } else {
+        const isolatedSource: Record<string, unknown> = Object.create(null)
+        let target: Record<string, unknown> | undefined
+        for (const key in source) {
+          const value = source[key]
+          if (isFunction(value)) {
+            if (!target) {
+              target = committedDynamicSources[i] = shallowReactive<
+                Record<string, unknown>
+              >({})
+            }
+            const committedSource = target
+            isolatedSource[key] = () => committedSource[key]
+          } else {
+            isolatedSource[key] = value
+          }
+        }
+        isolatedDynamicSources[i] = target ? isolatedSource : source
+      }
+    }
+    const symbols = Object.getOwnPropertySymbols(dynamicSources)
+    for (let i = 0; i < symbols.length; i++) {
+      ;(isolatedDynamicSources as any)[symbols[i]] = (dynamicSources as any)[
+        symbols[i]
+      ]
+    }
+    isolated.$ = isolatedDynamicSources
+  }
+
+  // Each source keeps its original position and key spelling so prop/attr
+  // precedence is unchanged. The writer belongs to the cached component's
+  // KeepAlive input scope, so deactivation pauses parent updates without
+  // pausing the component.
+  // Source invalidations while this effect is paused still leave it dirty.
+  // Resuming the input scope therefore schedules one commit with the
+  // latest raw props, while an unchanged cache entry needs no work on activation.
+  renderEffect(() => {
+    if (committed) {
+      for (const key in rawProps) {
+        if (key !== '$' && isFunction(rawProps[key])) {
+          committed[key] = resolveSource(rawProps[key])
+        }
+      }
+    }
+    if (dynamicSources) {
+      for (let i = 0; i < dynamicSources.length; i++) {
+        const source = dynamicSources[i]
+        const target = committedDynamicSources![i]
+        if (!target) continue
+        if (isFunction(source)) {
+          const next = resolveFunctionSource(source) || EMPTY_OBJ
+          const previous = previousDynamicSources![i]
+          for (const key in previous) {
+            if (!hasOwn(next, key)) {
+              delete target[key]
+              delete previous[key]
+            }
+          }
+          for (const key in next) {
+            target[key] = previous[key] = next[key]
+          }
+        } else {
+          for (const key in source) {
+            if (isFunction(source[key])) {
+              target[key] = resolveSource(source[key])
+            }
+          }
+        }
+      }
+    }
+  }, true)
+  return isolated
+}
 
 export function resolveSource<T>(source: T | (() => T)): T {
   return isFunction(source) ? resolveFunctionSource(source as () => T) : source
@@ -62,9 +200,9 @@ export function resolveFunctionSource<T>(
   // where source was defined.
   const parent = currentInstance && currentInstance.parent
   if (parent) {
-    // create the computed in the parent's context so it is collected by the
-    // parent's scope rather than whatever scope happens to be active here
-    const prev = setCurrentInstance(parent)
+    // execute the source in the parent's context, but collect its cache in the
+    // active consumer scope
+    const prev = setCurrentInstance(parent, getCurrentScope())
     try {
       source._cache = computed(oldValue => {
         const prevInner = setCurrentInstance(parent)
@@ -185,6 +323,15 @@ export function getPropsProxyHandlers(
           !isEmitListener(emitsOptions, key)
       : (key: string | symbol) => isString(key)
 
+  // vdom normalizes class and style on the vnode, so prop resolution already
+  // receives normalized values. Match that order here.
+  const normalizeRawProp = (key: string, value: unknown) => {
+    if (!value) return value
+    if (key === 'class' && !isString(value)) return normalizeClass(value)
+    if (key === 'style' && isObject(value)) return normalizeStyle(value)
+    return value
+  }
+
   const getProp = (instance: VaporComponentInstance, key: string | symbol) => {
     // this enables direct watching of props and prevents `Invalid watch source` DEV warnings.
     if (key === ReactiveFlags.IS_REACTIVE) return true
@@ -208,7 +355,10 @@ export function getPropsProxyHandlers(
             return resolvePropValue(
               propsOptions!,
               key,
-              isDynamic ? source[rawKey] : resolveSource(source[rawKey]),
+              normalizeRawProp(
+                key,
+                isDynamic ? source[rawKey] : resolveSource(source[rawKey]),
+              ),
               instance,
               resolveDefault,
             )
@@ -221,7 +371,7 @@ export function getPropsProxyHandlers(
         return resolvePropValue(
           propsOptions!,
           key,
-          resolveSource(rawProps[rawKey]),
+          normalizeRawProp(key, resolveSource(rawProps[rawKey])),
           instance,
           resolveDefault,
         )
@@ -479,16 +629,17 @@ export function hasFallthroughAttrs(
   rawProps: RawProps | null | undefined,
 ): boolean {
   if (rawProps) {
-    // determine fallthrough
-    if (rawProps.$ || !comp.props) {
+    // dynamic sources can produce attrs keys at any time
+    if (rawProps.$) {
       return true
-    } else {
-      // check if rawProps contains any keys not declared
-      const propsOptions = normalizePropsOptions(comp)[0]!
-      for (const key in rawProps) {
-        if (!hasOwn(propsOptions, camelize(key))) {
-          return true
-        }
+    }
+    // otherwise fallthrough potential requires an undeclared static key —
+    // static keys are fixed at creation, so an empty rawProps can never
+    // produce attrs later
+    const propsOptions = comp.props ? normalizePropsOptions(comp)[0]! : null
+    for (const key in rawProps) {
+      if (!propsOptions || !hasOwn(propsOptions, camelize(key))) {
+        return true
       }
     }
   }

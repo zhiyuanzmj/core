@@ -9,10 +9,10 @@ export enum VaporVForFlags {
    */
   FAST_REMOVE = 1,
   /**
-   * v-for used on component - we can skip creating child scopes for each block
-   * because the component itself already has a scope. This does not guarantee
-   * the item block is a VaporComponentInstance: component fallback paths may
-   * still return a DOM Node.
+   * v-for used on a component-shaped item. Component items require structural
+   * removal before item scope cleanup and cannot use the fast-clear path. This
+   * does not guarantee the item block is a VaporComponentInstance: component
+   * fallback paths may still return a DOM Node.
    */
   IS_COMPONENT = 1 << 1,
   /**
@@ -108,6 +108,12 @@ export enum VaporSlotFlags {
   // Per-slot function metadata. The slot root can start invalid or become
   // invalid, so fallback may be reachable and needs SlotFragment tracking.
   NON_STABLE = 1 << 3,
+  // Multiple independently invalid roots share one enclosing fallback
+  // decision instead of resolving that fallback from each root.
+  SHARED_FALLBACK = 1 << 4,
+  // The outlet is the only forwarded root, so it may resolve an enclosing
+  // fallback after its own local fallback is exhausted.
+  INHERIT_FALLBACK = 1 << 5,
 }
 
 export enum VaporDynamicComponentFlags {

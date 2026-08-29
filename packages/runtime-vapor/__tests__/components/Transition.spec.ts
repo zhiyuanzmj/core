@@ -370,6 +370,56 @@ describe('Transition', () => {
     expect(calls).toEqual([false, true])
   })
 
+  // #15202
+  test('should not track reactive reads from v-show transition hooks', async () => {
+    const show = ref(false)
+    const count = ref(0)
+    const source = vi.fn(() => show.value)
+    const onBeforeEnter = vi.fn(() => count.value++)
+    const data = ref({ source, onBeforeEnter })
+    const App = compile(
+      `<template>
+        <Transition :css="false" @before-enter="data.onBeforeEnter">
+          <div v-show="data.source()">content</div>
+        </Transition>
+      </template>`,
+      data,
+    )
+    define(App as any).render()
+
+    show.value = true
+    await nextTick()
+
+    expect(onBeforeEnter).toHaveBeenCalledTimes(1)
+    expect(count.value).toBe(1)
+    expect(source).toHaveBeenCalledTimes(2)
+  })
+
+  test('should not repeat v-show transition when truthiness is unchanged', async () => {
+    const onBeforeEnter = vi.fn()
+    const data = ref({
+      show: 0,
+      onBeforeEnter,
+    })
+    const App = compile(
+      `<template>
+        <Transition :css="false" @before-enter="data.onBeforeEnter">
+          <div v-show="data.show">content</div>
+        </Transition>
+      </template>`,
+      data,
+    )
+    define(App as any).render()
+
+    data.value.show = 1
+    await nextTick()
+    expect(onBeforeEnter).toHaveBeenCalledTimes(1)
+
+    data.value.show = 2
+    await nextTick()
+    expect(onBeforeEnter).toHaveBeenCalledTimes(1)
+  })
+
   test('v-if should own enter and leave when its root also has v-show', async () => {
     const onEnter = vi.fn((_el: Element, done: () => void) => done())
     const onLeave = vi.fn((_el: Element, done: () => void) => done())
@@ -1261,6 +1311,47 @@ describe('Transition', () => {
     expect(onLeave).not.toHaveBeenCalled()
   })
 
+  test('preserves multi-element vdom slot content nested under transition root', () => {
+    const data = ref({})
+    const Child = compile(
+      `<script setup vapor>
+        defineProps({ show: Boolean })
+      </script>
+      <template>
+        <Transition>
+          <div v-if="show" class="with-transition">
+            <slot />
+          </div>
+        </Transition>
+      </template>`,
+      data,
+    )
+    const App = compile(
+      `<script setup>
+        const Child = _components.Child
+      </script>
+      <template>
+        <Child :show="true">
+          <button class="first">First</button>
+          <button class="last">Last</button>
+        </Child>
+      </template>`,
+      data,
+      { Child },
+      { vapor: false },
+    )
+    const { host } = defineInterop(App as any).render()
+
+    expect(
+      '<transition> can only be used on a single element or component',
+    ).not.toHaveBeenWarned()
+    expect(
+      Array.from(host.querySelectorAll('.with-transition > button')).map(
+        el => el.textContent,
+      ),
+    ).toEqual(['First', 'Last'])
+  })
+
   test('vdom slot content should participate in transitions', async () => {
     let enterDone: (() => void) | undefined
     let leaveDone: (() => void) | undefined
@@ -1503,6 +1594,89 @@ describe('Transition', () => {
     expect(host.querySelector('span')?.textContent).toBe('second')
   })
 
+  test('teleport root should respect out-in transition mode', async () => {
+    let leaveDone: (() => void) | undefined
+    const target = document.createElement('div')
+    const onEnter = vi.fn((_el: Element, done: () => void) => done())
+    const onLeave = vi.fn((_el: Element, done: () => void) => {
+      leaveDone = done
+    })
+    const data = ref({ show: true, target, onEnter, onLeave })
+    const App = compile(
+      `<template>
+        <Transition
+          mode="out-in"
+          :css="false"
+          @enter="data.onEnter"
+          @leave="data.onLeave"
+        >
+          <template #default v-if="data.show">
+            <Teleport :to="data.target"><div>A</div></Teleport>
+          </template>
+          <template #default v-else>
+            <Teleport :to="data.target"><div>B</div></Teleport>
+          </template>
+        </Transition>
+      </template>`,
+      data,
+    )
+    const { app } = define(App).render()
+
+    try {
+      data.value.show = false
+      await nextTick()
+
+      expect(onLeave).toHaveBeenCalledOnce()
+      expect(onEnter).not.toHaveBeenCalled()
+      expect(target.textContent).toBe('A')
+
+      leaveDone!()
+      await nextTick()
+
+      expect(onEnter).toHaveBeenCalledOnce()
+      expect(target.textContent).toBe('B')
+    } finally {
+      leaveDone?.()
+      app.unmount()
+    }
+  })
+
+  test('disabled teleport should leave with its main-view owner', async () => {
+    let leaveDone: (() => void) | undefined
+    const target = document.createElement('div')
+    const onLeave = vi.fn((_el: Element, done: () => void) => {
+      leaveDone = done
+    })
+    const data = ref({ show: true, target, onLeave })
+    const App = compile(
+      `<template>
+        <Transition :css="false" @leave="data.onLeave">
+          <div v-if="data.show">
+            <Teleport :to="data.target" disabled><span>A</span></Teleport>
+          </div>
+        </Transition>
+      </template>`,
+      data,
+    )
+    const { app, host } = define(App).render()
+
+    try {
+      data.value.show = false
+      await nextTick()
+
+      expect(onLeave).toHaveBeenCalledOnce()
+      expect(host.textContent).toBe('A')
+
+      leaveDone!()
+      await nextTick()
+
+      expect(host.textContent).toBe('')
+    } finally {
+      leaveDone?.()
+      app.unmount()
+    }
+  })
+
   test('slot fallback should trigger enter hooks when slot content becomes empty', async () => {
     const onBeforeEnter = vi.fn()
     const onEnter = vi.fn()
@@ -1718,5 +1892,44 @@ describe('Transition', () => {
     data.value.show = false
     await nextTick()
     expect(el.className).toBe('b-leave-from b-leave-active')
+  })
+
+  // #15274
+  test('should merge fallthrough class with a transition child root', async () => {
+    const data = ref({
+      internalClass: 'internal-box',
+      externalClass: 'external-class',
+    })
+    const Child = compile(
+      `<template>
+        <Transition>
+          <div class="box" :class="data.internalClass">child</div>
+        </Transition>
+      </template>`,
+      data,
+    )
+    const App = compile(
+      `<template>
+        <components.Child :class="data.externalClass" />
+      </template>`,
+      data,
+      { Child },
+    )
+    const { host } = define(App as any).render()
+    const el = host.querySelector('div')!
+
+    expect([...el.classList]).toEqual(
+      expect.arrayContaining(['external-class', 'box', 'internal-box']),
+    )
+    expect(el.classList).toHaveLength(3)
+
+    data.value.internalClass = 'internal-next'
+    data.value.externalClass = 'external-next'
+    await nextTick()
+
+    expect([...el.classList]).toEqual(
+      expect.arrayContaining(['external-next', 'box', 'internal-next']),
+    )
+    expect(el.classList).toHaveLength(3)
   })
 })

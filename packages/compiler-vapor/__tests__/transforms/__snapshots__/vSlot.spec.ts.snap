@@ -7,14 +7,11 @@ const t0 = _template(" ")
 export function render(_ctx) {
   const n2 = _createAssetComponent("Comp", null, {
     $: [
-      () => (_createForSlots(_ctx.list, (item) => ({
-        name: "default",
-        fn: () => {
-          const n0 = t0()
-          _renderEffect(() => _setText(n0, _toDisplayString(item)))
-          return n0
-        }
-      })))
+      _createForSlots(() => (_ctx.list), (_for_item0) => () => {
+        const n0 = t0()
+        _renderEffect(() => _setText(n0, _toDisplayString(_for_item0.value)))
+        return n0
+      }, (item) => ("default"))
     ]
   }, true)
   return n2
@@ -61,6 +58,24 @@ export function render(_ctx) {
 }"
 `;
 
+exports[`compiler: transform slot > dynamic slots name w/ keyed v-for 1`] = `
+"import { toDisplayString as _toDisplayString, setText as _setText, renderEffect as _renderEffect, createForSlots as _createForSlots, createAssetComponent as _createAssetComponent, template as _template } from 'vue';
+const t0 = _template(" ")
+
+export function render(_ctx) {
+  const n2 = _createAssetComponent("Comp", null, {
+    $: [
+      _createForSlots(() => (_ctx.list), (_for_item0) => () => {
+        const n0 = t0()
+        _renderEffect(() => _setText(n0, _toDisplayString(_for_item0.value.label)))
+        return n0
+      }, (item) => (item.name), (item) => (item.id))
+    ]
+  }, true)
+  return n2
+}"
+`;
+
 exports[`compiler: transform slot > dynamic slots name w/ v-for 1`] = `
 "import { toDisplayString as _toDisplayString, setText as _setText, renderEffect as _renderEffect, createForSlots as _createForSlots, createAssetComponent as _createAssetComponent, template as _template } from 'vue';
 const t0 = _template(" ")
@@ -68,14 +83,11 @@ const t0 = _template(" ")
 export function render(_ctx) {
   const n2 = _createAssetComponent("Comp", null, {
     $: [
-      () => (_createForSlots(_ctx.list, (item) => ({
-        name: item,
-        fn: (_slotProps0) => {
-          const n0 = t0()
-          _renderEffect(() => _setText(n0, _toDisplayString(_slotProps0.bar)))
-          return n0
-        }
-      })))
+      _createForSlots(() => (_ctx.list), (_for_item0) => (_slotProps1) => {
+        const n0 = t0()
+        _renderEffect(() => _setText(n0, _toDisplayString(_slotProps1.bar)))
+        return n0
+      }, (item) => (item))
     ]
   }, true)
   return n2
@@ -89,13 +101,10 @@ const t0 = _template("foo", 2)
 export function render(_ctx) {
   const n2 = _createAssetComponent("Comp", null, {
     $: [
-      () => (_createForSlots(_ctx.list, (_, __, index) => ({
-        name: index,
-        fn: () => {
-          const n0 = t0()
-          return n0
-        }
-      })))
+      _createForSlots(() => (_ctx.list), (_for_item0, _, _for_index0) => () => {
+        const n0 = t0()
+        return n0
+      }, (_, __, index) => (index))
     ]
   }, true)
   return n2
@@ -147,7 +156,7 @@ export function render(_ctx) {
   const _component_Comp = _resolveComponent("Comp")
   const n2 = _createComponentWithFallback(_component_Comp, null, () => {
     const n1 = _createComponentWithFallback(_component_Comp, null, _extend(() => {
-      const n0 = _createSlot()
+      const n0 = _createSlot("default", null, null, 36 /* SLOT_ROOT, INHERIT_FALLBACK */)
       return n0
     }, { _: 8 /* NON_STABLE */ }))
     return n1
@@ -161,7 +170,7 @@ exports[`compiler: transform slot > forwarded slots > <slot> tag only 1`] = `
 
 export function render(_ctx) {
   const n1 = _createAssetComponent("Comp", null, _extend(() => {
-    const n0 = _createSlot()
+    const n0 = _createSlot("default", null, null, 36 /* SLOT_ROOT, INHERIT_FALLBACK */)
     return n0
   }, { _: 8 /* NON_STABLE */ }), true)
   return n1
@@ -173,7 +182,7 @@ exports[`compiler: transform slot > forwarded slots > <slot> tag w/ template 1`]
 
 export function render(_ctx) {
   const n2 = _createAssetComponent("Comp", null, _extend(() => {
-    const n0 = _createSlot()
+    const n0 = _createSlot("default", null, null, 36 /* SLOT_ROOT, INHERIT_FALLBACK */)
     return n0
   }, { _: 8 /* NON_STABLE */ }), true)
   return n2
@@ -186,7 +195,7 @@ exports[`compiler: transform slot > forwarded slots > <slot> tag w/ v-for 1`] = 
 export function render(_ctx) {
   const n3 = _createAssetComponent("Comp", null, _extend(() => {
     const n0 = _createFor(() => (_ctx.b), (_for_item0) => {
-      const n2 = _createSlot()
+      const n2 = _createSlot("default", null, null, 20 /* SLOT_ROOT, SHARED_FALLBACK */)
       return n2
     }, undefined, 48 /* IS_FRAGMENT, SLOT_ROOT */)
     return n0
@@ -201,7 +210,7 @@ exports[`compiler: transform slot > forwarded slots > <slot> tag w/ v-if 1`] = `
 export function render(_ctx) {
   const n3 = _createAssetComponent("Comp", null, _extend(() => {
     const n0 = _createIf(() => (_ctx.ok), () => {
-      const n2 = _createSlot()
+      const n2 = _createSlot("default", null, null, 36 /* SLOT_ROOT, INHERIT_FALLBACK */)
       return n2
     }, null, 129 /* TRUE_SINGLE_ROOT, SLOT_ROOT */)
     return n0
@@ -355,9 +364,9 @@ export function render(_ctx) {
   const _component_Foo = _resolveComponent("Foo")
   const _component_Bar = _resolveComponent("Bar")
   const n6 = t0()
-  _setInsertionState(n6, null, 0)
+  _setInsertionState(n6)
   const n0 = _createSlot("foo")
-  _setInsertionState(n6, null, 1)
+  _setInsertionState(n6, 1)
   const n1 = _createIf(() => (true), () => {
     const n3 = _createComponentWithFallback(_component_Foo)
     return n3
@@ -394,7 +403,7 @@ export function render(_ctx) {
         return n4
       }, null, 129 /* TRUE_SINGLE_ROOT, SLOT_ROOT */)
       return n2
-    })
+    }, 36 /* SLOT_ROOT, INHERIT_FALLBACK */)
     return n0
   }, { _: 8 /* NON_STABLE */ }), true)
   return n5
@@ -409,7 +418,7 @@ const t1 = _template("<div>")
 export function render(_ctx) {
   const n4 = _createAssetComponent("Comp", null, () => {
     const n3 = t1()
-    _setInsertionState(n3, null, 0)
+    _setInsertionState(n3)
     const n0 = _createIf(() => (_ctx.show), () => {
       const n2 = t0()
       return n2
@@ -470,13 +479,10 @@ exports[`compiler: transform slot > slot owner context > dynamic slot source wit
 export function render(_ctx) {
   const n2 = _createAssetComponent("Comp", null, {
     $: [
-      () => (_createForSlots(_ctx.slots, (_, name) => ({
-        name: name,
-        fn: () => {
-          const n0 = _createSlot(() => (name))
-          return n0
-        }
-      })))
+      _createForSlots(() => (_ctx.slots), (_for_item0, _for_key0) => () => {
+        const n0 = _createSlot(() => (_for_key0.value), null, null, 36 /* SLOT_ROOT, INHERIT_FALLBACK */)
+        return n0
+      }, (_, name) => (name))
     ]
   }, true)
   return n2
@@ -492,7 +498,7 @@ export function render(_ctx) {
   const n5 = _createAssetComponent("Comp", null, _extend(() => {
     const n0 = _createFor(() => (_ctx.items), (_for_item0) => {
       const n3 = t0()
-      _setInsertionState(n3, null, 0)
+      _setInsertionState(n3)
       const n2 = _createComponentWithFallback(_component_ChildComp)
       return n3
     }, undefined, 40 /* IS_SINGLE_NODE, SLOT_ROOT */)
@@ -511,7 +517,7 @@ export function render(_ctx) {
   const n5 = _createAssetComponent("Comp", null, _extend(() => {
     const n0 = _createIf(() => (_ctx.show), () => {
       const n3 = t0()
-      _setInsertionState(n3, null, 0)
+      _setInsertionState(n3)
       const n2 = _createComponentWithFallback(_component_ChildComp)
       return n3
     }, null, 129 /* TRUE_SINGLE_ROOT, SLOT_ROOT */)
@@ -542,7 +548,7 @@ export function render(_ctx) {
   const n5 = _createAssetComponent("Comp", null, _extend(() => {
     const n0 = _createIf(() => (_ctx.show), () => {
       const n3 = t0()
-      _setInsertionState(n3, null, 0)
+      _setInsertionState(n3)
       const n2 = _createPlainElement("my-element")
       return n3
     }, null, 129 /* TRUE_SINGLE_ROOT, SLOT_ROOT */)
@@ -596,10 +602,10 @@ export function render(_ctx) {
   const n8 = _createAssetComponent("Comp", null, _extend(() => {
     const n0 = _createIf(() => (_ctx.a), () => {
       const n6 = t1()
-      _setInsertionState(n6, null, 0)
+      _setInsertionState(n6)
       const n2 = _createIf(() => (_ctx.b), () => {
         const n5 = t0()
-        _setInsertionState(n5, null, 0)
+        _setInsertionState(n5)
         const n4 = _createComponentWithFallback(_component_ChildComp)
         return n5
       })
@@ -643,7 +649,7 @@ exports[`compiler: transform slot > slot owner context > slot with slot outlet i
 
 export function render(_ctx) {
   const n2 = _createAssetComponent("Comp", null, _extend(() => {
-    const n0 = _createSlot()
+    const n0 = _createSlot("default", null, null, 36 /* SLOT_ROOT, INHERIT_FALLBACK */)
     return n0
   }, { _: 8 /* NON_STABLE */ }), true)
   return n2

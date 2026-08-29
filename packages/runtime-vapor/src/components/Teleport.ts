@@ -12,6 +12,7 @@ import {
   isTeleportDeferred,
   isTeleportDisabled,
   logMismatchError,
+  queuePostFlushCb,
   queuePostRenderEffect,
   resolveTeleportTarget,
   restoreCurrentInstance,
@@ -32,14 +33,15 @@ import { extend, isArray } from '@vue/shared'
 import {
   RenderContextFragment,
   isFragment,
+  resolveFragmentAnchor,
   runWithFragmentCtxOnly,
 } from '../fragment'
 import {
   advanceHydrationNode,
+  claimAnchor,
   currentHydrationNode,
   isComment,
   isHydrating,
-  markHydrationAnchor,
   runWithoutHydration,
   setCurrentHydrationNode,
 } from '../dom/hydration'
@@ -47,14 +49,19 @@ import type { DefineVaporSetupFnComponent } from '../apiDefineComponent'
 import type { RawSlots } from '../componentSlots'
 import { applyTransitionHooks, isTransitionEnabled } from '../transition'
 import { enableTeleport } from '../teleport'
+import { TELEPORT } from '../fragmentFlags'
 
 const VaporTeleportImpl = {
   name: 'VaporTeleport',
   __isTeleport: true,
   __vapor: true,
 
-  process(props: LooseRawProps, slots?: RawSlots | null): TeleportFragment {
-    return new TeleportFragment(props, slots)
+  process(
+    props: LooseRawProps,
+    slots?: RawSlots | null,
+    adoptAnchor?: Node,
+  ): TeleportFragment {
+    return new TeleportFragment(props, slots, adoptAnchor)
   },
 }
 
@@ -75,11 +82,6 @@ type TeleportMountState =
     }
 
 export class TeleportFragment extends RenderContextFragment {
-  /**
-   * @internal marker for duck typing to avoid direct instanceof check
-   * which prevents tree-shaking of TeleportFragment
-   */
-  readonly __tf = true
   anchor?: Node
   private resolvedProps?: TeleportProps
   private rawSlots?: RawSlots | null
@@ -99,14 +101,18 @@ export class TeleportFragment extends RenderContextFragment {
   private mountToTargetJob?: SchedulerJob
   private parentSuspense?: SuspenseBoundary | null
 
-  constructor(props: LooseRawProps, slots?: RawSlots | null) {
-    super([])
+  constructor(
+    props: LooseRawProps,
+    slots?: RawSlots | null,
+    adoptAnchor?: Node,
+  ) {
+    super([], TELEPORT)
     this.rawSlots = slots
+    // the main-view end anchor can adopt the template `<!>` placeholder the
+    // teleport was anchored to, saving a runtime node
     this.anchor = isHydrating
       ? undefined
-      : __DEV__
-        ? createComment('teleport end')
-        : createTextNode()
+      : resolveFragmentAnchor(adoptAnchor, 'teleport end')
 
     const propsProxy = new Proxy(
       props,
@@ -207,8 +213,6 @@ export class TeleportFragment extends RenderContextFragment {
     remove(this.nodes, mountState.container)
     // mount new nodes
     this.nodes = children
-    const onBeforeInsert = this.onBeforeInsert
-    if (onBeforeInsert) onBeforeInsert.forEach(fn => fn(this.nodes))
     insert(children, mountState.container, mountState.anchor)
     this.bindChildren(this.nodes)
     this.updateCssVars()
@@ -231,8 +235,6 @@ export class TeleportFragment extends RenderContextFragment {
     if (this.mountState.location !== TeleportMountLocation.None) {
       move(this.nodes, parent, anchor, MoveType.REORDER)
     } else {
-      const onBeforeInsert = this.onBeforeInsert
-      if (onBeforeInsert) onBeforeInsert.forEach(fn => fn(this.nodes))
       insert(this.nodes, parent, anchor)
     }
     this.mountState = { location, container: parent, anchor }
@@ -380,26 +382,34 @@ export class TeleportFragment extends RenderContextFragment {
     // content is already in target, skip the props update so target children
     // are not re-inserted.
     insert(this.placeholder, container, anchor)
+    // insertFragment/move may have already placed this.anchor and passed it
+    // back as the insertion anchor; insertNode skips the self-insert then.
     insert(this.anchor!, container, anchor)
     if (!wasMountedInTarget) {
       this.handlePropsUpdate()
     }
   }
 
-  dispose = (): void => {
+  private cancelMountToTarget(): void {
     if (this.mountToTargetJob) {
       this.mountToTargetJob.flags! |= SchedulerJobFlags.DISPOSED
       this.mountToTargetJob = undefined
     }
+  }
 
-    // remove nodes
+  disposeTarget(): void {
+    this.cancelMountToTarget()
+
     const mountState = this.mountState
-    if (this.nodes && mountState.location !== TeleportMountLocation.None) {
-      remove(this.nodes, mountState.container)
+    if (this.nodes && mountState.location === TeleportMountLocation.Target) {
+      const targetParent =
+        (this.targetStart && parentNode(this.targetStart)) ||
+        (this.targetAnchor && parentNode(this.targetAnchor)) ||
+        undefined
+      remove(this.nodes, targetParent)
       this.nodes = []
+      this.mountState = { location: TeleportMountLocation.None }
     }
-
-    this.mountState = { location: TeleportMountLocation.None }
 
     // remove anchors
     if (this.targetStart) {
@@ -412,6 +422,23 @@ export class TeleportFragment extends RenderContextFragment {
     }
 
     this.target = undefined
+  }
+
+  scheduleTargetDispose(): void {
+    // A deferred target mount may already be ahead of the fallback in the
+    // post-flush queue, so cancel it synchronously with scope teardown.
+    this.cancelMountToTarget()
+    queuePostFlushCb(() => this.disposeTarget())
+  }
+
+  dispose = (): void => {
+    const mountState = this.mountState
+    if (this.nodes && mountState.location === TeleportMountLocation.Main) {
+      remove(this.nodes, mountState.container)
+      this.nodes = []
+    }
+    this.disposeTarget()
+    this.mountState = { location: TeleportMountLocation.None }
   }
 
   remove = (_parent?: ParentNode): void => {
@@ -432,13 +459,14 @@ export class TeleportFragment extends RenderContextFragment {
     target: TeleportTargetElement,
     targetNode: Node | null,
   ): void {
+    if (!isHydrating) return
     let targetAnchor = targetNode
     while (targetAnchor) {
       if (targetAnchor.nodeType === 8) {
         if ((targetAnchor as Comment).data === 'teleport start anchor') {
           this.targetStart = targetAnchor
         } else if ((targetAnchor as Comment).data === 'teleport anchor') {
-          this.targetAnchor = markHydrationAnchor(targetAnchor)
+          this.targetAnchor = claimAnchor(targetAnchor)
           target._lpa = this.targetAnchor.nextSibling
           break
         }
@@ -454,7 +482,7 @@ export class TeleportFragment extends RenderContextFragment {
     if (!isHydrating) return
     let nextNode = this.placeholder!.nextSibling!
     setCurrentHydrationNode(nextNode)
-    this.anchor = markHydrationAnchor(locateTeleportEndAnchor(nextNode)!)
+    this.anchor = claimAnchor(locateTeleportEndAnchor(nextNode)!)
     this.mountState = {
       location: TeleportMountLocation.Main,
       container: parentNode(this.anchor)!,
@@ -472,9 +500,7 @@ export class TeleportFragment extends RenderContextFragment {
   private mountChildren(target: Node): void {
     if (!isHydrating) return
     target.appendChild((this.targetStart = createTextNode('')))
-    target.appendChild(
-      (this.targetAnchor = markHydrationAnchor(createTextNode(''))),
-    )
+    target.appendChild((this.targetAnchor = claimAnchor(createTextNode(''))))
     this.mountState = {
       location: TeleportMountLocation.Target,
       container: target as ParentNode,
@@ -512,7 +538,7 @@ export class TeleportFragment extends RenderContextFragment {
           targetNode,
         )
       } else {
-        this.anchor = markHydrationAnchor(
+        this.anchor = claimAnchor(
           locateTeleportEndAnchor(currentHydrationNode!.nextSibling!)!,
         )
         this.hydrateTargetAnchors(target as TeleportTargetElement, targetNode)
@@ -543,7 +569,7 @@ export class TeleportFragment extends RenderContextFragment {
       // Align with VDOM Teleport hydration: keep main-view markers only and
       // avoid mounting children inline or eagerly initializing them when the
       // target is missing.
-      this.anchor = markHydrationAnchor(
+      this.anchor = claimAnchor(
         locateTeleportEndAnchor(currentHydrationNode!.nextSibling!)!,
       )
     }

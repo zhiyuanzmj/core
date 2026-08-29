@@ -116,6 +116,32 @@ describe('compile', () => {
         expect(code).matchSnapshot()
       })
 
+      test('object literal binding value', () => {
+        const code = compile(
+          `<div v-example="{ value: msg, other: 1 }"></div>`,
+          {
+            bindingMetadata: {
+              msg: BindingTypes.SETUP_REF,
+              vExample: BindingTypes.SETUP_CONST,
+            },
+          },
+        )
+        expect(code).matchSnapshot()
+        expect(code).contains('() => ({ value: _ctx.msg, other: 1 })')
+      })
+
+      test('object literal binding value w/ inline mode', () => {
+        const code = compile(`<div v-example="{ value: msg }"></div>`, {
+          inline: true,
+          bindingMetadata: {
+            msg: BindingTypes.SETUP_REF,
+            vExample: BindingTypes.SETUP_CONST,
+          },
+        })
+        expect(code).matchSnapshot()
+        expect(code).contains('() => ({ value: msg.value })')
+      })
+
       test('static parameters', () => {
         const code = compile(`<div v-example:foo="msg"></div>`, {
           bindingMetadata: {
@@ -317,7 +343,7 @@ describe('compile', () => {
       })
       expect(code).contains(
         `_renderEffect(() => _setProp(n1, "id", _ctx.useId()))
-  _setInsertionState(n1, null, 0)
+  _setInsertionState(n1)
   const n0 = _createAssetComponent("Child")`,
       )
       expect(code).matchSnapshot()
@@ -473,9 +499,9 @@ describe('compile', () => {
       expect(code).matchSnapshot()
       expect(code).not.contains('let p0 = ')
       expect(code).not.contains('let p2 = ')
-      expect(code).contains('let p1 = _next(_child(n2), 1)')
+      expect(code).contains('let p1 = _next(_child(n2))')
       expect(code).contains('const n0 = _child(p1)')
-      expect(code).contains('const n1 = _child((p1 = _next(p1, 2)))')
+      expect(code).contains('const n1 = _child((p1 = _next(p1)))')
     })
   })
 })

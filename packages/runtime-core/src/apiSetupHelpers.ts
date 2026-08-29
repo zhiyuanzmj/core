@@ -309,8 +309,8 @@ type DefineModelDefault<T> = InferDefault<Data, T>
  * ```
  */
 export function defineModel<T, M extends PropertyKey = string, G = T, S = T>(
-  options: ({ default: DefineModelDefault<T> } | { required: true }) &
-    DefineModelRuntimeOptions<T, G, S>,
+  options: DefineModelRuntimeOptions<T, G, S> &
+    ({ default: DefineModelDefault<T> } | { required: true }),
 ): ModelRef<T, M, G, S>
 
 export function defineModel<T, M extends PropertyKey = string, G = T, S = T>(
@@ -319,8 +319,8 @@ export function defineModel<T, M extends PropertyKey = string, G = T, S = T>(
 
 export function defineModel<T, M extends PropertyKey = string, G = T, S = T>(
   name: string,
-  options: ({ default: DefineModelDefault<T> } | { required: true }) &
-    DefineModelRuntimeOptions<T, G, S>,
+  options: DefineModelRuntimeOptions<T, G, S> &
+    ({ default: DefineModelDefault<T> } | { required: true }),
 ): ModelRef<T, M, G, S>
 
 export function defineModel<T, M extends PropertyKey = string, G = T, S = T>(
@@ -362,9 +362,9 @@ type PropsWithDefaults<
   BKeys extends keyof T,
 > = T extends unknown
   ? Readonly<MappedOmit<T, keyof Defaults>> & {
-      readonly [K in keyof Defaults as K extends keyof T
-        ? K
-        : never]-?: K extends keyof T
+      readonly [
+        K in keyof Defaults as K extends keyof T ? K : never
+      ]-?: K extends keyof T
         ? Defaults[K] extends undefined
           ? IfAny<Defaults[K], NotUndefined<T[K]>, T[K]>
           : NotUndefined<T[K]>

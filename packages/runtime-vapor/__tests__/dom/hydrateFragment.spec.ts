@@ -1,7 +1,9 @@
 import { DynamicFragment, SlotFragment } from '../../src/fragment'
+import { DYNAMIC, IF, NATIVE_CHILDREN } from '../../src/fragmentFlags'
 import {
+  claimAnchor,
   hydrateNode,
-  markHydrationAnchor,
+  setCurrentHydrationNode,
   setIsHydratingEnabled,
 } from '../../src/dom/hydration'
 import {
@@ -33,6 +35,17 @@ function expectKind<K extends AnchorPlan['kind']>(
   return plan as Extract<AnchorPlan, { kind: K }>
 }
 
+describe('DynamicFragment flags', () => {
+  test('constructor holds the DYNAMIC invariant', () => {
+    expect(
+      new DynamicFragment(0, undefined, false, false).__vf & DYNAMIC,
+    ).toBeTruthy()
+    expect(
+      new DynamicFragment(IF, undefined, false, false).__vf & IF,
+    ).toBeTruthy()
+  })
+})
+
 describe('resolveDynamicAnchor', () => {
   test('empty branch reuses SSR placeholder comment', () => {
     const host = document.createElement('div')
@@ -40,7 +53,7 @@ describe('resolveDynamicAnchor', () => {
     host.append(placeholder)
 
     const plan = resolveWithCursor(placeholder, () =>
-      resolveDynamicAnchor(new DynamicFragment('if', false, false), true),
+      resolveDynamicAnchor(new DynamicFragment(IF, 'if', false, false), true),
     )
 
     const reuse = expectKind(plan, 'reuse')
@@ -54,7 +67,7 @@ describe('resolveDynamicAnchor', () => {
     host.append(target)
 
     const plan = resolveWithCursor(target, () =>
-      resolveDynamicAnchor(new DynamicFragment('if', false, false), true),
+      resolveDynamicAnchor(new DynamicFragment(IF, 'if', false, false), true),
     )
 
     const create = expectKind(plan, 'create')
@@ -70,7 +83,7 @@ describe('resolveDynamicAnchor', () => {
     host.append(stale, anchor)
 
     const plan = resolveWithCursor(stale, () =>
-      resolveDynamicAnchor(new DynamicFragment('if', false, false), true),
+      resolveDynamicAnchor(new DynamicFragment(IF, 'if', false, false), true),
     )
 
     const reuse = expectKind(plan, 'reuse')
@@ -85,7 +98,7 @@ describe('resolveDynamicAnchor', () => {
     host.append(stale, footer)
 
     const plan = resolveWithCursor(stale, () =>
-      resolveDynamicAnchor(new DynamicFragment('if', false, false), true),
+      resolveDynamicAnchor(new DynamicFragment(IF, 'if', false, false), true),
     )
 
     const cleanup = expectKind(plan, 'create-cleanup')
@@ -103,7 +116,7 @@ describe('resolveDynamicAnchor', () => {
     host.append(comment)
 
     const plan = resolveWithCursor(comment, () => {
-      const frag = new DynamicFragment('dynamic-component', false, false)
+      const frag = new DynamicFragment(0, 'dynamic-component', false, false)
       frag.nodes = comment
       return resolveDynamicAnchor(frag, false)
     })
@@ -120,7 +133,7 @@ describe('resolveDynamicAnchor', () => {
     host.append(stale, footer)
 
     const plan = resolveWithCursor(stale, () => {
-      const frag = new DynamicFragment('if', false, false)
+      const frag = new DynamicFragment(IF, 'if', false, false)
       frag.nodes = document.createComment('')
       return resolveDynamicAnchor(frag, false)
     })
@@ -132,7 +145,7 @@ describe('resolveDynamicAnchor', () => {
     expect(cleanup.cleanupUntil).toBe(footer)
   })
 
-  test('non-forwarded slot reuses the boundary close anchor', () => {
+  test('empty slot reuses the boundary close anchor', () => {
     const host = document.createElement('div')
     const start = document.createComment('[')
     const end = document.createComment(']')
@@ -149,36 +162,16 @@ describe('resolveDynamicAnchor', () => {
     expect(reuse.resetNodes).toBeUndefined()
   })
 
-  test('empty forwarded slot reuses the boundary close anchor', () => {
+  test('empty slot creates after an already reused boundary close anchor', () => {
     const host = document.createElement('div')
     const start = document.createComment('[')
-    const end = document.createComment(']')
-    host.append(start, end)
-
-    const plan = resolveWithCursor(start, () =>
-      withHydratingSlotBoundary(() => {
-        const frag = new SlotFragment()
-        frag.forwarded = true
-        return resolveDynamicAnchor(frag, true)
-      }),
-    )
-
-    const reuse = expectKind(plan, 'reuse')
-    expect(reuse.node).toBe(end)
-    expect(reuse.resetNodes).toBeUndefined()
-  })
-
-  test('empty forwarded slot creates after an already reused boundary close anchor', () => {
-    const host = document.createElement('div')
-    const start = document.createComment('[')
-    const end = markHydrationAnchor(document.createComment(']'))
+    const end = claimAnchor(document.createComment(']'))
     const footer = document.createElement('footer')
     host.append(start, end, footer)
 
     const plan = resolveWithCursor(start, () =>
       withHydratingSlotBoundary(() => {
         const frag = new SlotFragment()
-        frag.forwarded = true
         return resolveDynamicAnchor(frag, true)
       }),
     )
@@ -200,7 +193,7 @@ describe('resolveDynamicAnchor', () => {
         const finish = startPendingSlotContent(start)
         try {
           return resolveDynamicAnchor(
-            new DynamicFragment('if', false, false),
+            new DynamicFragment(IF, 'if', false, false),
             true,
           )
         } finally {
@@ -212,6 +205,54 @@ describe('resolveDynamicAnchor', () => {
     const pending = expectKind(plan, 'pending')
     expect(pending.parent).toBe(host)
     expect(pending.slotEnd).toBe(end)
+  })
+
+  test('rendered invalid fragment waits for pending slot content decision', () => {
+    const host = document.createElement('div')
+    const start = document.createComment('[')
+    const end = document.createComment(']')
+    host.append(start, end)
+
+    const plan = resolveWithCursor(start, () =>
+      withHydratingSlotBoundary(() => {
+        const finish = startPendingSlotContent(start)
+        try {
+          const frag = new DynamicFragment(0, 'keyed', false, false)
+          frag.nodes = document.createComment('')
+          return resolveDynamicAnchor(frag, false)
+        } finally {
+          finish(false)
+        }
+      }),
+    )
+
+    const pending = expectKind(plan, 'pending')
+    expect(pending.parent).toBe(host)
+    expect(pending.slotEnd).toBe(end)
+  })
+
+  test('rendered invalid fragment reuses its anchor after a markerless pending range', () => {
+    const host = document.createElement('div')
+    const anchor = document.createComment('keyed')
+    host.append(anchor)
+
+    const plan = resolveWithCursor(anchor, () =>
+      withHydratingSlotBoundary(() => {
+        const finish = startPendingSlotContent(anchor)
+        try {
+          setCurrentHydrationNode(null)
+          const frag = new DynamicFragment(0, 'keyed', false, false)
+          frag.nodes = anchor
+          return resolveDynamicAnchor(frag, false)
+        } finally {
+          finish(false)
+        }
+      }),
+    )
+
+    const reuse = expectKind(plan, 'reuse')
+    expect(reuse.node).toBe(anchor)
+    expect(reuse.resetNodes).toBe(true)
   })
 
   test('nested invalid pending slot content preserves outer pending anchors', () => {
@@ -258,7 +299,7 @@ describe('resolveDynamicAnchor', () => {
 
     const plan = resolveWithCursor(start, () =>
       withHydratingSlotBoundary(() =>
-        resolveDynamicAnchor(new DynamicFragment('if', false, false), true),
+        resolveDynamicAnchor(new DynamicFragment(IF, 'if', false, false), true),
       ),
     )
 
@@ -269,12 +310,12 @@ describe('resolveDynamicAnchor', () => {
 
   test('empty fragment creates after an already reused placeholder', () => {
     const host = document.createElement('div')
-    const comment = markHydrationAnchor(document.createComment(''))
+    const comment = claimAnchor(document.createComment(''))
     const footer = document.createElement('footer')
     host.append(comment, footer)
 
     const plan = resolveWithCursor(comment, () => {
-      const frag = new DynamicFragment('dynamic-component', false, false)
+      const frag = new DynamicFragment(0, 'dynamic-component', false, false)
       frag.nodes = comment
       return resolveDynamicAnchor(frag, false)
     })
@@ -285,6 +326,37 @@ describe('resolveDynamicAnchor', () => {
     expect(create.resetNodes).toBe(true)
   })
 
+  test('native-children fragment adopts its injected seed anchor', () => {
+    const host = document.createElement('div')
+    const seed = claimAnchor(document.createTextNode(''))
+    host.append(seed)
+
+    const frag = new DynamicFragment(NATIVE_CHILDREN, '', false, false)
+    const plan = resolveWithCursor(seed, () => resolveDynamicAnchor(frag, true))
+
+    const reuse = expectKind(plan, 'reuse')
+    expect(reuse.node).toBe(seed)
+  })
+
+  test('empty native-children fragment trims the whole container tail', () => {
+    const host = document.createElement('div')
+    const first = document.createElement('span')
+    const second = document.createElement('b')
+    host.append(first, second)
+
+    const frag = new DynamicFragment(NATIVE_CHILDREN, '', false, false)
+    const plan = resolveWithCursor(first, () =>
+      resolveDynamicAnchor(frag, true),
+    )
+
+    const create = expectKind(plan, 'create-cleanup')
+    expect(create.parent).toBe(host)
+    expect(create.next).toBeNull()
+    expect(create.cleanupStart).toBe(first)
+    expect(create.cleanupUntil).toBeNull()
+    expect(create.cleanupContainer).toBe(host)
+  })
+
   test('keyed fragment creates from its block boundary', () => {
     const host = document.createElement('div')
     const el = document.createElement('span')
@@ -292,7 +364,7 @@ describe('resolveDynamicAnchor', () => {
     host.append(el, footer)
 
     const plan = resolveWithCursor(el, () => {
-      const frag = new DynamicFragment('keyed', false, false)
+      const frag = new DynamicFragment(0, 'keyed', false, false)
       frag.nodes = el
       return resolveDynamicAnchor(frag, false)
     })

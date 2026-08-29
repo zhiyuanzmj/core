@@ -1,10 +1,11 @@
-import { type Block, type BlockFn, insert, removeNode } from './block'
+import { type Block, type BlockFn, removeNode } from './block'
 import {
   type HydrationCursor,
   advanceHydrationNode,
+  claimUntrackedAnchor,
   currentHydrationNode,
   enterHydrationCursor,
-  exitHydrationCursor,
+  isComment,
   isHydrating,
 } from './dom/hydration'
 import {
@@ -13,7 +14,8 @@ import {
   resetInsertionState,
 } from './insertionState'
 import { renderEffect } from './renderEffect'
-import { DynamicFragment } from './fragment'
+import { DynamicFragment, finishBlockCreation } from './fragment'
+import { IF } from './fragmentFlags'
 import { createComment, createTextNode } from './dom/node'
 import { VaporBlockShape, VaporIfFlags } from '@vue/shared'
 
@@ -30,6 +32,8 @@ export function createIf(
   if (!isHydrating) resetInsertionState()
   let hydrationCursor: HydrationCursor | null = null
   let branchShape: VaporBlockShape | undefined
+  // the fragment's own anchor, when it has one; the `v-if` once path has none
+  let anchor: Node | undefined
 
   let frag: Block
   if (flags & VaporIfFlags.ONCE) {
@@ -44,7 +48,11 @@ export function createIf(
       ? b1()
       : b2
         ? b2()
-        : [__DEV__ ? createComment('if') : createTextNode()]
+        : [
+            claimUntrackedAnchor(
+              __DEV__ ? createComment('if') : createTextNode(),
+            ),
+          ]
   } else {
     // DynamicFragment should be keyed for correct transition behavior
     // and KeepAlive cache identity. The encoded value is index + 1, so 0 is
@@ -54,7 +62,8 @@ export function createIf(
     const keyBase = keyed ? (index - 1) * 2 : 0
     const trackSlotBoundary = !!(flags & VaporIfFlags.SLOT_ROOT)
     const dynamicFragment = new DynamicFragment(
-      isHydrating || __DEV__ ? 'if' : undefined,
+      IF,
+      __DEV__ ? 'if' : undefined,
       keyed,
       false,
       trackSlotBoundary,
@@ -65,7 +74,9 @@ export function createIf(
             if (parent) removeNode(anchor, parent)
           }
         : undefined,
+      _insertionAnchor,
     )
+    anchor = dynamicFragment.anchor
     frag = dynamicFragment
     renderEffect(() => {
       const ok = condition()
@@ -83,24 +94,22 @@ export function createIf(
     })
   }
 
-  if (!isHydrating) {
-    if (_insertionParent) insert(frag, _insertionParent, _insertionAnchor)
-  } else {
-    // SSR empty branches render as <!---->, and no template adoption consumes
-    // that comment. Claim it before restoring the outer cursor.
-    if (branchShape === VaporBlockShape.EMPTY && hydrationCursor) {
-      const start = hydrationCursor.start
-      if (
-        start &&
-        currentHydrationNode === start &&
-        start.nodeType === 8 &&
-        (start as Comment).data === ''
-      ) {
-        advanceHydrationNode(start)
-      }
+  // SSR empty branches render as <!---->, and no template adoption consumes
+  // that comment. Claim it before restoring the outer cursor.
+  if (isHydrating && branchShape === VaporBlockShape.EMPTY && hydrationCursor) {
+    const start = hydrationCursor.start
+    if (start && currentHydrationNode === start && isComment(start, '')) {
+      advanceHydrationNode(start)
     }
-    exitHydrationCursor(hydrationCursor)
   }
+
+  finishBlockCreation(
+    frag,
+    anchor,
+    hydrationCursor,
+    _insertionParent,
+    _insertionAnchor,
+  )
 
   return frag
 }

@@ -521,7 +521,11 @@ export { type NormalizedPropsOptions } from './componentProps'
 /**
  * @internal
  */
-export { type VaporInteropInterface } from './apiCreateApp'
+export {
+  type VaporInVdomInterface,
+  type VdomInVaporInterface,
+  type VdomSlotOptions,
+} from './apiCreateApp'
 /**
  * @internal
  */
@@ -620,7 +624,12 @@ export {
 /**
  * @internal
  */
-export { ensureValidVNode, ensureVaporSlotFallback } from './helpers/renderSlot'
+export {
+  ensureValidVNode,
+  ensureVaporSlotFallback,
+  rawVaporSlotKey,
+  vdomSlotFallbackKey,
+} from './helpers/renderSlot'
 /**
  * @internal
  */
@@ -676,7 +685,7 @@ export { createCanSetSetupRefChecker } from './rendererTemplateRef'
 /**
  * @internal
  */
-export { isTemplateNode } from './hydration'
+export { isTemplateNode, getContainerType } from './hydration'
 
 /**
  * @internal
@@ -702,6 +711,7 @@ export {
   warnExtraneousAttributes,
   getFunctionalFallthrough,
   isFunctionalFallthroughKey,
+  filterModelListeners,
   shouldUpdateComponent,
 } from './componentRenderUtils'
 

@@ -39,6 +39,7 @@ import {
 import { VaporDynamicComponentFlags, VaporSlotFlags } from '@vue/shared'
 import { VaporSlot } from '../../runtime-core/src/vnode'
 import { compile, makeInteropRender } from './_utils'
+import { isInteropFragment } from '../src/fragment'
 import {
   type VaporComponentInstance,
   type VaporDirective,
@@ -67,10 +68,12 @@ import {
 } from '../src'
 
 const define = makeInteropRender()
+const inheritedFallbackSlotRootFlags =
+  VaporSlotFlags.SLOT_ROOT | VaporSlotFlags.INHERIT_FALLBACK
 
 describe('vdomInterop', () => {
   describe('key', () => {
-    test('preserves vnode key on blocks passed from vdom to vapor', () => {
+    test('marks vdom blocks as interop fragments and preserves keys', () => {
       const VDomChild = defineComponent({
         setup() {
           return () => h('div', 'vdom child')
@@ -79,16 +82,15 @@ describe('vdomInterop', () => {
 
       const app = createApp({ render: () => null })
       app.use(vaporInteropPlugin)
-      const vapor = (app._context as any).vapor
+      const vdom = (app._context as any).vdom
 
-      const vnodeBlock = vapor.vdomMountVNode(
-        h(VDomChild, { key: 'foo' }),
-        null,
-      )
+      const vnodeBlock = vdom.mountVNode(h(VDomChild, { key: 'foo' }), null)
+      expect(isInteropFragment(vnodeBlock)).toBe(true)
       expect(vnodeBlock.$key).toBe('foo')
       expect(vnodeBlock.vnode.key).toBe('foo')
 
-      const componentBlock = vapor.vdomMount(VDomChild, null, { key: 'bar' })
+      const componentBlock = vdom.mount(VDomChild, null, { key: 'bar' })
+      expect(isInteropFragment(componentBlock)).toBe(true)
       expect(componentBlock.$key).toBe('bar')
       expect(componentBlock.vnode.key).toBe('bar')
     })
@@ -125,10 +127,10 @@ describe('vdomInterop', () => {
 
       const app = createApp(Parent)
       app.use(vaporInteropPlugin)
-      const vapor = (app._context as any).vapor
-      const originalVdomSlot = vapor.vdomSlot
+      const vdom = (app._context as any).vdom
+      const originalVdomSlot = vdom.slot
       let frag: any
-      vapor.vdomSlot = (...args: any[]) => (frag = originalVdomSlot(...args))
+      vdom.slot = (...args: any[]) => (frag = originalVdomSlot(...args))
 
       const host = document.createElement('div')
       app.mount(host)
@@ -155,10 +157,10 @@ describe('vdomInterop', () => {
 
       const app = createApp({ render: () => null })
       app.use(vaporInteropPlugin)
-      const vapor = (app._context as any).vapor
+      const vdom = (app._context as any).vdom
       const host = document.createElement('div')
 
-      const frag = vapor.vdomMount(VDomChild, null)
+      const frag = vdom.mount(VDomChild, null)
       insert(frag, host)
 
       expect(host.innerHTML).toBe('<!--v-if-->')
@@ -197,10 +199,10 @@ describe('vdomInterop', () => {
 
       const app = createApp(Parent)
       app.use(vaporInteropPlugin)
-      const vapor = (app._context as any).vapor
-      const originalVdomSlot = vapor.vdomSlot
+      const vdom = (app._context as any).vdom
+      const originalVdomSlot = vdom.slot
       let frag: any
-      vapor.vdomSlot = (...args: any[]) => (frag = originalVdomSlot(...args))
+      vdom.slot = (...args: any[]) => (frag = originalVdomSlot(...args))
 
       const host = document.createElement('div')
       app.mount(host)
@@ -568,6 +570,37 @@ describe('vdomInterop', () => {
         'directive updated',
         'vnode updated',
       ])
+    })
+
+    test('should resolve inherited props when vapor renders a vdom component', () => {
+      const VDomChild = defineComponent({
+        extends: {
+          props: {
+            modelValue: { type: Boolean, default: false },
+          },
+        },
+        setup(props: any, { attrs }) {
+          return () =>
+            h(
+              'div',
+              `${typeof props.modelValue}:${String(props.modelValue)}:${String('model-value' in attrs)}`,
+            )
+        },
+      })
+      const App = compile(
+        `<template>
+          <components.VDomChild :model-value="false" />
+          <components.VDomChild />
+        </template>`,
+        ref(null),
+        { VDomChild },
+      )
+
+      const { html } = define(App as any).render()
+
+      expect(html()).toBe(
+        '<div>boolean:false:false</div><div>boolean:false:false</div>',
+      )
     })
   })
 
@@ -1495,7 +1528,13 @@ describe('vdomInterop', () => {
             VDomInnerSlot as any,
             null,
             {
-              bar: () => createSlot('bar', null),
+              bar: () =>
+                createSlot(
+                  'bar',
+                  null,
+                  undefined,
+                  inheritedFallbackSlotRootFlags,
+                ),
             },
             true,
           )
@@ -1659,11 +1698,11 @@ describe('vdomInterop', () => {
         const slots = useSlots()
         return createComponent(Inner, null, {
           $: [
-            () =>
-              createForSlots(slots, (_slot, name) => ({
-                name,
-                fn: () => createSlot(name),
-              })) as any,
+            createForSlots(
+              () => slots,
+              (_slot, name) => () => createSlot(() => name!.value),
+              (_slot, name) => name,
+            ) as any,
           ],
         })
       })
@@ -2067,16 +2106,16 @@ describe('vdomInterop', () => {
         setup() {
           return createComponent(VDomChild as any, null, {
             $: [
-              () =>
-                createForSlots(list.value, value => ({
-                  name: 'default',
-                  fn: () => {
-                    const n = template('<span> </span>')() as Element
-                    const t = txt(n) as Text
-                    renderEffect(() => setText(t, toDisplayString(value)))
-                    return n
-                  },
-                })),
+              createForSlots(
+                () => list.value,
+                value => () => {
+                  const n = template('<span> </span>')() as Element
+                  const t = txt(n) as Text
+                  renderEffect(() => setText(t, toDisplayString(value.value)))
+                  return n
+                },
+                () => 'default',
+              ),
             ],
           })
         },
@@ -2101,7 +2140,7 @@ describe('vdomInterop', () => {
       expect(html()).toBe('<div><span>1</span></div>')
     })
 
-    test('dynamic slots via createForSlots should re-mount fragment slot in vdom child', async () => {
+    test('dynamic slots via createForSlots should update fragment slot in vdom child', async () => {
       const list = ref([0, 1, 2])
 
       const VDomChild = defineComponent({
@@ -2114,20 +2153,22 @@ describe('vdomInterop', () => {
         setup() {
           return createComponent(VDomChild as any, null, {
             $: [
-              () =>
-                createForSlots(list.value, value => ({
-                  name: 'default',
-                  fn: () =>
-                    createIf(
-                      () => true,
-                      () => {
-                        const n = template('<span> </span>')() as Element
-                        const t = txt(n) as Text
-                        renderEffect(() => setText(t, toDisplayString(value)))
-                        return n
-                      },
-                    ),
-                })),
+              createForSlots(
+                () => list.value,
+                value => () =>
+                  createIf(
+                    () => true,
+                    () => {
+                      const n = template('<span> </span>')() as Element
+                      const t = txt(n) as Text
+                      renderEffect(() =>
+                        setText(t, toDisplayString(value.value)),
+                      )
+                      return n
+                    },
+                  ),
+                () => 'default',
+              ),
             ],
           })
         },
@@ -2169,20 +2210,21 @@ describe('vdomInterop', () => {
         setup() {
           return createComponent(VDomChild as any, null, {
             $: [
-              () =>
-                createForSlots(list.value, value => ({
-                  name: 'default',
-                  fn: () => {
-                    const state = slotStates.get(value)!
-                    const n = template('<span> </span>')() as Element
-                    const t = txt(n) as Text
-                    renderEffect(() => {
-                      state.runs()
-                      setText(t, state.text.value)
-                    })
-                    return n
-                  },
-                })),
+              createForSlots(
+                () => list.value,
+                value => () => {
+                  const state = slotStates.get(value.value)!
+                  const n = template('<span> </span>')() as Element
+                  const t = txt(n) as Text
+                  renderEffect(() => {
+                    state.runs()
+                    setText(t, state.text.value)
+                  })
+                  return n
+                },
+                () => 'default',
+                value => value,
+              ),
             ],
           })
         },
@@ -2865,6 +2907,65 @@ describe('vdomInterop', () => {
         it.each([
           ['component type', (component: any) => component],
           ['component VNode', (component: any) => h(component)],
+        ])(
+          'moves a VDOM %s root through the current KeepAlive leave transition',
+          async (_, toValue) => {
+            const VDOMCompA = defineComponent({
+              setup: () => () => h('div', 'A'),
+            })
+            const vdomRoot = shallowRef<any>(toValue(VDOMCompA))
+            const VaporCompA = compile(
+              `<template><component :is="data" /></template>`,
+              vdomRoot,
+            )
+            const VaporCompB = compile(
+              `<template><div>B</div></template>`,
+              ref(),
+            )
+            let finishLeave: (() => void) | undefined
+            const firstLeave = vi.fn(
+              (_el: Element, done: () => void) => (finishLeave = done),
+            )
+            const secondLeave = vi.fn(
+              (_el: Element, done: () => void) => (finishLeave = done),
+            )
+            const data = shallowRef({
+              current: VaporCompA,
+              onLeave: firstLeave,
+            })
+            const App = compile(
+              `<template>
+                <Transition :css="false" @leave="data.onLeave">
+                  <KeepAlive :max="2">
+                    <component :is="data.current" />
+                  </KeepAlive>
+                </Transition>
+              </template>`,
+              data,
+            )
+            const { host, app } = define(App as any).render()
+            const a = host.firstElementChild
+
+            data.value = { ...data.value, onLeave: secondLeave }
+            await nextTick()
+            data.value = { ...data.value, current: VaporCompB }
+            await nextTick()
+
+            expect(firstLeave).not.toHaveBeenCalled()
+            expect(secondLeave).toHaveBeenCalledOnce()
+            expect(a!.parentNode).toBe(host)
+
+            finishLeave!()
+            await nextTick()
+            expect(a!.parentNode).not.toBe(host)
+
+            app.unmount()
+          },
+        )
+
+        it.each([
+          ['component type', (component: any) => component],
+          ['component VNode', (component: any) => h(component)],
         ])('prunes a VDOM %s when max is reached', async (_, toValue) => {
           const source = ref(0)
           const renderA = vi.fn()
@@ -2915,7 +3016,7 @@ describe('vdomInterop', () => {
           app.unmount()
         })
 
-        it('deactivates then prunes a Vapor component VNode when max is reached', async () => {
+        it('unmounts a Vapor component VNode pruned during the same switch', async () => {
           const deactivatedA = vi.fn()
           const unmountedA = vi.fn()
           const renderA = vi.fn((value: number) => value)
@@ -2962,7 +3063,7 @@ describe('vdomInterop', () => {
           expect(host.innerHTML).toBe(
             '<div>vapor B</div><!--dynamic-component-->',
           )
-          expect(deactivatedA).toHaveBeenCalledOnce()
+          expect(deactivatedA).not.toHaveBeenCalled()
           expect(unmountedA).toHaveBeenCalledOnce()
           expect(a!.parentNode).toBeNull()
 
@@ -3231,6 +3332,56 @@ describe('vdomInterop', () => {
       msg.value = 'bar'
       await nextTick()
       expect(html()).toBe('<div data-msg="bar">bar</div>')
+    })
+
+    it('should fallthrough attrs to a vnode root rendered by a dynamic component', async () => {
+      const id = ref('a')
+      const VaporChild = compile(
+        `<template><component :is="data" /></template>`,
+        ref(h('div', null, 'vnode')),
+      )
+
+      const { html } = define({
+        setup() {
+          return () => h(VaporChild as any, { id: id.value })
+        },
+      }).render()
+
+      expect(html()).toBe('<div id="a">vnode</div><!--dynamic-component-->')
+
+      id.value = 'b'
+      await nextTick()
+      expect(html()).toBe('<div id="b">vnode</div><!--dynamic-component-->')
+    })
+
+    it('should fallthrough attrs to a component vnode root and keep its state', async () => {
+      const id = ref('a')
+      const VDomChild = defineComponent({
+        setup() {
+          const n = ref(0)
+          return () => h('div', { onClick: () => n.value++ }, String(n.value))
+        },
+      })
+      const VaporChild = compile(
+        `<template><component :is="data" /></template>`,
+        ref(h(VDomChild)),
+      )
+
+      const { html, host } = define({
+        setup() {
+          return () => h(VaporChild as any, { id: id.value })
+        },
+      }).render()
+
+      expect(html()).toBe('<div id="a">0</div><!--dynamic-component-->')
+      ;(host.children[0] as HTMLElement).click()
+      await nextTick()
+      expect(html()).toBe('<div id="a">1</div><!--dynamic-component-->')
+
+      // an attrs update must patch, not remount: the inner state survives
+      id.value = 'b'
+      await nextTick()
+      expect(html()).toBe('<div id="b">1</div><!--dynamic-component-->')
     })
   })
 
@@ -4266,7 +4417,13 @@ describe('vdomInterop', () => {
                     VDomSlotOutlet as any,
                     null,
                     {
-                      default: () => createSlot('default'),
+                      default: () =>
+                        createSlot(
+                          'default',
+                          null,
+                          undefined,
+                          inheritedFallbackSlotRootFlags,
+                        ),
                     },
                     true,
                   ),
@@ -4410,7 +4567,9 @@ describe('vdomInterop', () => {
         await flushResolution(pending.promise)
 
         expect(errorHandler).not.toHaveBeenCalled()
-        expect(host.innerHTML).toBe('<div><span>async</span></div>')
+        // the async child's `<!>` insertion anchor survives the directive
+        // removing its sibling, keeping the deferred mount position stable
+        expect(host.innerHTML).toBe('<div><span>async</span><!----></div>')
       } finally {
         app.unmount()
         host.remove()

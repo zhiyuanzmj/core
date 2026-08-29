@@ -1,18 +1,17 @@
-import { isArray } from '@vue/shared'
-import { queueJob, queuePostFlushCb } from '@vue/runtime-dom'
+import { NOOP, isArray } from '@vue/shared'
 import {
   advanceHydrationNode,
+  claimAnchor,
+  claimUntrackedAnchor,
   cleanupHydrationTail,
   currentHydrationNode,
   enterHydrationBoundary,
+  isClaimedAnchor,
   isComment,
-  isHydrationAnchor,
-  isInAsyncHydration,
   isInDeferredHydrationBoundary,
   locateEndAnchor,
   locateHydrationBoundaryClose,
   locateHydrationNode,
-  markHydrationAnchor,
   nextLogicalSibling,
   setCurrentHydrationNode,
 } from './hydration'
@@ -22,40 +21,137 @@ import {
   parentNode as getParentNode,
   updateLastLocatedLogicalChild,
 } from './node'
-import { EMPTY_BLOCK, findBlockBoundary, isValidBlock } from '../block'
+import {
+  type Block,
+  EMPTY_BLOCK,
+  findBlockBoundary,
+  isValidBlock,
+  move,
+} from '../block'
 import type { DynamicFragment } from '../fragment'
+import { IF, NATIVE_CHILDREN, SLOT } from '../fragmentFlags'
 
-interface HydratingSlotBoundaryState {
-  endAnchor: Node | null
-  // Slot content is still resolving whether it should claim the SSR range.
-  pending: boolean
-  pendingAnchors: PendingSlotContentAnchor[] | null
-}
-
-let currentHydratingSlotBoundaryState: HydratingSlotBoundaryState | null = null
-
-interface PendingSlotContentAnchor {
+interface DeferredSlotAnchor {
   onContent: () => void
   onFallback: () => void
 }
 
-function setCurrentHydratingSlotBoundaryState(
-  state: HydratingSlotBoundaryState | null,
-): HydratingSlotBoundaryState | null {
-  try {
-    return currentHydratingSlotBoundaryState
-  } finally {
-    currentHydratingSlotBoundaryState = state
+/*
+ * ## Slot hydration session (two-phase commit)
+ *
+ * SSR output does not distinguish slot content from slot fallback, but
+ * claiming server nodes is destructive (the cursor advances, anchors get
+ * claimed). So while a slot is still deciding which side owns its SSR range,
+ * anchor claims are *deferred* into a ledger and settled once the decision
+ * lands. A session is that ledger plus the boundary's end anchor.
+ *
+ * Structure:
+ * - One session per slot boundary, stacked for nesting
+ *   (`currentSlotHydrationSession` is the top; the previous top is restored
+ *   by the `with*` wrappers below).
+ * - Within a session, `beginSegment` opens a nested pending window
+ *   (LIFO, closed by the returned `finish(contentValid)`).
+ * - `defer()` records an anchor claim in the innermost pending window;
+ *   with no window open it refuses and the caller acts immediately.
+ *
+ * Settlement rules:
+ * - Content proves valid → the *entire* ledger settles as content, outer
+ *   segments included: once real content exists anywhere in the boundary,
+ *   every deferred SSR candidate belongs to the content side.
+ *   `markContentSettled()` (real DOM/text rendered — see `template()` and
+ *   `createComponent`, the only two signal sources) does the same.
+ * - Content proves invalid → only the innermost segment's entries roll back
+ *   to their fallback action; entries deferred by outer segments stay pending
+ *   for the outer decision. The cursor rewinds to the segment's start.
+ * - A pending *boundary* that ends still undecided hands its ledger to the
+ *   parent boundary (`adoptInto`), whose enclosing segment settles it.
+ */
+class SlotHydrationSession {
+  private deferred: DeferredSlotAnchor[] | null = null
+
+  constructor(
+    readonly endAnchor: Node | null,
+    public pending: boolean,
+  ) {}
+
+  /** Record a claim in the ledger; false = no pending window, act now. */
+  defer(anchor: DeferredSlotAnchor): boolean {
+    if (!this.pending) return false
+    ;(this.deferred ||= []).push(anchor)
+    return true
+  }
+
+  /**
+   * Settle ledger entries. `from > 0` (only ever passed for an invalid
+   * inner segment) rolls back just that segment's tail of the ledger.
+   */
+  private settle(contentValid: boolean, from = 0): void {
+    const deferred = this.deferred
+    if (!deferred) return
+    const batch = from ? deferred.splice(from) : deferred
+    if (!from) this.deferred = null
+    for (let i = 0; i < batch.length; i++) {
+      if (contentValid) {
+        batch[i].onContent()
+      } else {
+        batch[i].onFallback()
+      }
+    }
+  }
+
+  /**
+   * Open a pending window. The returned `finish` is idempotent and applies
+   * the settlement rules above; on invalid content it also rewinds the
+   * cursor to `start` so fallback hydrates the range content walked over.
+   */
+  beginSegment(start: Node | null): (contentValid: boolean) => void {
+    const prevPending = this.pending
+    const watermark = this.deferred ? this.deferred.length : 0
+    this.pending = true
+    let active = true
+    return contentValid => {
+      if (!active) return
+      active = false
+      this.settle(contentValid, !contentValid && prevPending ? watermark : 0)
+      this.pending = prevPending
+      if (!contentValid) {
+        setCurrentHydrationNode(start)
+      }
+    }
+  }
+
+  /**
+   * Unconditional variant for a child boundary that settled: the parent's
+   * ledger settles as content even if the parent itself was not pending —
+   * it may hold entries adopted from an earlier undecided child.
+   */
+  settleAsContent(): void {
+    this.settle(true)
+    this.pending = false
+  }
+
+  /** Boundary ended still undecided: its ledger becomes the parent's. */
+  adoptInto(parent: SlotHydrationSession): void {
+    if (this.deferred) {
+      ;(parent.deferred ||= []).push(...this.deferred)
+      this.deferred = null
+    }
   }
 }
 
+let currentSlotHydrationSession: SlotHydrationSession | null = null
+
 export function getCurrentSlotEndAnchor(): Node | null {
-  return currentHydratingSlotBoundaryState
-    ? currentHydratingSlotBoundaryState.endAnchor
+  return currentSlotHydrationSession
+    ? currentSlotHydrationSession.endAnchor
     : null
 }
 
-export function withHydratingSlotBoundary<R>(fn: () => R): R {
+/** Locate this boundary's SSR range and consume its opening marker. */
+function enterSlotBoundaryRange(): {
+  endAnchor: Node | null
+  exitHydrationBoundary: (() => void) | undefined
+} {
   let endAnchor = getCurrentSlotEndAnchor()
   let exitHydrationBoundary: (() => void) | undefined
 
@@ -65,131 +161,217 @@ export function withHydratingSlotBoundary<R>(fn: () => R): R {
     setCurrentHydrationNode(currentHydrationNode.nextSibling)
     exitHydrationBoundary = enterHydrationBoundary(endAnchor)
   }
-  const prevState = setCurrentHydratingSlotBoundaryState({
-    endAnchor,
-    pending: false,
-    pendingAnchors: null,
-  })
+  return { endAnchor, exitHydrationBoundary }
+}
+
+export function withHydratingSlotBoundary<R>(fn: () => R): R {
+  const { endAnchor, exitHydrationBoundary } = enterSlotBoundaryRange()
+  const prevSession = currentSlotHydrationSession
+  currentSlotHydrationSession = new SlotHydrationSession(endAnchor, false)
 
   try {
     return fn()
   } finally {
-    setCurrentHydratingSlotBoundaryState(prevState)
+    currentSlotHydrationSession = prevSession
     exitHydrationBoundary && exitHydrationBoundary()
   }
 }
 
-function resolvePendingSlotContentAnchors(
-  state: HydratingSlotBoundaryState,
-  contentValid: boolean,
-  startIndex: number = 0,
-): void {
-  // Empty fragments rendered before the slot decision wait until content wins
-  // before claiming the current SSR anchor candidate.
-  const pendingAnchors = state.pendingAnchors
-  if (!pendingAnchors) return
-  const anchors = startIndex
-    ? pendingAnchors.splice(startIndex)
-    : pendingAnchors
-  if (!startIndex) state.pendingAnchors = null
-  for (let i = 0; i < anchors.length; i++) {
-    const pendingAnchor = anchors[i]
-    if (contentValid) {
-      pendingAnchor.onContent()
+/**
+ * A boundary that starts undecided (forwarded interop slots): if `fn`
+ * completes without settling, the range stays unclaimed — the ledger is
+ * adopted by the parent boundary and the cursor rewinds. If it settles,
+ * the parent's own pending window settles as content along with it.
+ */
+export function withPendingHydratingSlotBoundary<R>(fn: () => R): R {
+  const parentSession = currentSlotHydrationSession!
+  const contentStart = currentHydrationNode
+  const { endAnchor, exitHydrationBoundary } = enterSlotBoundaryRange()
+  const session = new SlotHydrationSession(endAnchor, true)
+  currentSlotHydrationSession = session
+  let completed = false
+
+  try {
+    const result = fn()
+    completed = true
+    return result
+  } finally {
+    currentSlotHydrationSession = parentSession
+    if (!completed) {
+      exitHydrationBoundary && exitHydrationBoundary()
+    } else if (session.pending) {
+      session.adoptInto(parentSession)
+      setCurrentHydrationNode(contentStart)
     } else {
-      pendingAnchor.onFallback()
+      exitHydrationBoundary && exitHydrationBoundary()
+      parentSession.settleAsContent()
     }
   }
 }
 
 export function queuePendingSlotContentAnchor(
-  anchor: PendingSlotContentAnchor,
-): void {
-  const state = currentHydratingSlotBoundaryState
-  if (state && state.pending) {
-    ;(state.pendingAnchors ||= []).push(anchor)
+  anchor: DeferredSlotAnchor,
+): boolean {
+  const session = currentSlotHydrationSession
+  return !!session && session.defer(anchor)
+}
+
+/**
+ * Builds the attach step of a deferred shared-fallback decision. Once the
+ * winning side is known, resolve the reference node, then either claim the
+ * candidate SSR range's end anchor (when this host won one) or insert the
+ * runtime anchor, and move the host's nodes into place. The claim itself
+ * stays host-specific: which anchor fields it publishes and whether the
+ * hydration cursor must advance differ per host.
+ */
+export function createDeferredSlotAttach(
+  contentStart: Node | null,
+  slotEnd: Node | null,
+  runtimeAnchor: Node,
+  candidate: Node | null,
+  claimCandidate: (candidate: Node) => Node,
+  getNodes: () => Block,
+  onAttached?: (parent: ParentNode) => void,
+): () => void {
+  return () => {
+    const insertionAnchor = resolveDeferredInsertionAnchor(
+      candidate,
+      contentStart,
+      slotEnd,
+    )
+    const parent = insertionAnchor && insertionAnchor.parentNode
+    if (!parent) return
+    let anchor: Node
+    if (candidate) {
+      anchor = claimCandidate(candidate)
+    } else {
+      insertUntrackedAnchor(parent, insertionAnchor, runtimeAnchor)
+      anchor = runtimeAnchor
+    }
+    if (onAttached) onAttached(parent)
+    move(getNodes(), parent, anchor)
   }
+}
+
+/**
+ * Claims the SSR fragment close marker directly preceding a receiver slot's
+ * end anchor. Slot content hydrating inside the receiver does not own that
+ * marker, but boundary cleanup can run before deferred anchors are inserted,
+ * so it must be marked as claimed up front.
+ */
+export function claimPrecedingFragmentClose(slotEnd: Node | null): void {
+  const previous = slotEnd && slotEnd.previousSibling
+  if (previous && isComment(previous, ']')) {
+    claimAnchor(previous)
+  }
+}
+
+/**
+ * The reference node a deferred slot anchor attaches before: the candidate
+ * range's end when one exists, otherwise the (still-attached) content start,
+ * otherwise the receiver slot's end anchor.
+ */
+function resolveDeferredInsertionAnchor(
+  candidate: Node | null,
+  contentStart: Node | null,
+  slotEnd: Node | null,
+): Node | null {
+  return (
+    candidate ||
+    (contentStart && contentStart.parentNode ? contentStart : slotEnd)
+  )
 }
 
 // Slot content with fallback is unresolved until it creates a valid node.
-// While unresolved, empty content branches must not consume fallback SSR anchors.
+// While unresolved, empty content branches must not consume fallback SSR
+// anchors.
 export function startPendingSlotContent(
   start: Node | null,
 ): (contentValid: boolean) => void {
-  const state = currentHydratingSlotBoundaryState
-  if (!state) return () => {}
-  const prevPending = state.pending
-  const pendingAnchorStart = state.pendingAnchors
-    ? state.pendingAnchors.length
-    : 0
-  state.pending = true
-  let active = true
-  return contentValid => {
-    if (!active) return
-    active = false
-    resolvePendingSlotContentAnchors(
-      state,
-      contentValid,
-      !contentValid && prevPending ? pendingAnchorStart : 0,
-    )
-    state.pending = prevPending
-    if (!contentValid) {
-      setCurrentHydrationNode(start)
+  const session = currentSlotHydrationSession
+  if (!session) return () => {}
+  return session.beginSegment(start)
+}
+
+export interface PendingSlotContentGuard {
+  /** Resolve the pending fallback-vs-content decision; later calls no-op. */
+  finish(contentValid: boolean): void
+  /** finally-path safety: resolve as valid content unless already resolved. */
+  settle(): void
+}
+
+/**
+ * Wraps startPendingSlotContent's one-shot protocol: the decision must be
+ * resolved exactly once, and an abandoned render (throw) must resolve it as
+ * content so the enclosing slot hydration session can continue. Inactive
+ * guards (`shouldDefer` false) are inert.
+ */
+export const INERT_PENDING_SLOT_CONTENT: PendingSlotContentGuard = {
+  finish: NOOP,
+  settle: NOOP,
+}
+
+export function startPendingSlotContentGuard(
+  shouldDefer: boolean,
+  start: Node | null,
+): PendingSlotContentGuard {
+  if (!shouldDefer) return INERT_PENDING_SLOT_CONTENT
+  let finish: ((contentValid: boolean) => void) | null =
+    startPendingSlotContent(start)
+  const resolve = (contentValid: boolean): void => {
+    if (finish) {
+      finish(contentValid)
+      finish = null
     }
   }
+  return { finish: resolve, settle: () => resolve(true) }
 }
 
 export function resolvePendingSlotContent(): void {
-  const state = currentHydratingSlotBoundaryState
-  if (state && state.pending) {
-    resolvePendingSlotContentAnchors(state, true)
-    state.pending = false
-  }
+  const session = currentSlotHydrationSession
+  if (session && session.pending) session.settleAsContent()
 }
 
 export function isPendingSlotContent(): boolean {
-  const state = currentHydratingSlotBoundaryState
-  return !!(state && state.pending)
+  const session = currentSlotHydrationSession
+  return !!(session && session.pending)
 }
 
-function queueAnchorInsert(
+/**
+ * Insert an anchor at a position resolved during the hydration pass. Untracked
+ * anchors hold no SSR logical position, so traversal steps over them and the
+ * insert can happen right away. `nextNode` may already have been trimmed by
+ * boundary cleanup, in which case the anchor is appended instead.
+ */
+export function insertUntrackedAnchor(
   parentNode: Node,
   nextNode: Node | null,
-  createAnchor: () => Node,
-  fallbackNextNode?: Node | null,
+  anchor: Node,
 ): void {
-  // Create the runtime anchor during the queued insertion so hydration
-  // traversal never observes it before it is in its final position.
-  const insertAnchor = () => {
-    let anchor =
-      nextNode && getParentNode(nextNode) === parentNode ? nextNode : null
-    if (
-      !anchor &&
-      fallbackNextNode &&
-      getParentNode(fallbackNextNode) === parentNode
-    ) {
-      anchor = fallbackNextNode
-    }
-    parentNode.insertBefore(createAnchor(), anchor)
-  }
-  if (isInAsyncHydration()) {
-    // Async hydration can queue a branch update before post-flush. Queue its
-    // structural anchor as a pre job so the update sees a live insertion point.
-    queueJob(insertAnchor, undefined, true)
-  } else {
-    queuePostFlushCb(insertAnchor)
-  }
+  parentNode.insertBefore(
+    anchor,
+    nextNode && getParentNode(nextNode) === parentNode ? nextNode : null,
+  )
 }
 
+/**
+ * Whether `node` can serve as `frag`'s anchor. Beyond the SSR candidates
+ * (`<!---->` and a fragment close), dev builds also accept a runtime anchor
+ * this fragment kind already created: those carry the fragment's debug label
+ * as their comment data, where prod uses unlabeled text nodes.
+ */
 function isReusableAnchorCandidate(
   node: Node | null,
-  anchorLabel?: string,
+  frag?: DynamicFragment,
 ): node is Comment {
   return (
     !!node &&
     (isComment(node, '') ||
       isComment(node, ']') ||
-      (anchorLabel !== undefined && isComment(node, anchorLabel)))
+      (__DEV__ &&
+        frag !== undefined &&
+        frag.anchorLabel !== undefined &&
+        isComment(node, frag.anchorLabel)))
   )
 }
 
@@ -198,7 +380,7 @@ function reuseOrCreateAfterAnchor(
   resetNodes?: boolean,
 ): AnchorPlan {
   const parent = getParentNode(node)
-  return isHydrationAnchor(node) && parent
+  return isClaimedAnchor(node) && parent
     ? { kind: 'create', parent, next: node.nextSibling, resetNodes }
     : { kind: 'reuse', node, resetNodes }
 }
@@ -210,7 +392,7 @@ export function prepareDeferredHydrationAnchor(
   const isRevivingDeferredBranch =
     isInDeferredHydrationBoundary() &&
     hasRender &&
-    !frag.isSlot &&
+    !(frag.__vf & SLOT) &&
     !isValidBlock(frag.nodes)
 
   const reusingDeferredAnchor =
@@ -229,7 +411,7 @@ export function prepareDeferredHydrationAnchor(
         ? slotEndAnchor
         : null)
     if (anchor) {
-      setCurrentHydrationNode(markHydrationAnchor(anchor))
+      setCurrentHydrationNode(claimAnchor(anchor))
     }
   }
 
@@ -245,21 +427,20 @@ export function prepareDeferredHydrationAnchor(
 export type AnchorPlan =
   // Adopt an existing comment node as the fragment anchor.
   | { kind: 'reuse'; node: Node; resetNodes?: boolean }
-  // Delay an empty slot-content anchor until content/fallback is decided.
+  // Delay an invalid slot-content anchor until content/fallback is decided.
   // If fallback wins, the content anchor is created detached.
   | {
       kind: 'pending'
       parent: Node
-      slotEnd: Node
+      slotEnd: Node | null
     }
-  // Insert a fresh runtime anchor before `next` once insertion flushes.
+  // Insert a fresh runtime anchor before `next`.
   // `mark` keeps an SSR node structural so boundary cleanup preserves it.
   | {
       kind: 'create'
       parent: Node
       next: Node | null
       mark?: Node
-      fallbackNext?: Node | null
       resetNodes?: boolean
     }
   // Trim unclaimed SSR content first, then insert a fresh runtime anchor.
@@ -273,100 +454,153 @@ export type AnchorPlan =
       cleanupContainer?: ParentNode
     }
 
-export function resolveDynamicAnchor(
+/*
+ * ## Anchor resolution protocol
+ *
+ * SSR output carries no dedicated anchors for dynamic blocks — only fragment
+ * markers (`<!--[-->` / `<!--]-->`), empty placeholders (`<!---->`) and
+ * teleport markers. Every dynamic fragment must therefore *infer* its anchor
+ * from what the server happened to render, or create one of its own.
+ * `resolveDynamicAnchor` encodes that inference as an ordered rule list;
+ * the first rule that recognises the situation returns the plan.
+ *
+ * 1. `planPendingSlotDecision` — slot content vs fallback is still
+ *    undecided, so claiming anything now could steal the fallback's nodes.
+ *    Defer the whole decision (`pending`).
+ * 2. `planReuseInjectedAnchor` — a native-children fragment finds the anchor
+ *    `createPlainElement` seeded for it still under the cursor: adopt it.
+ * 3. `planEmptyBranch` — the client rendered nothing. Claim a reusable SSR
+ *    comment at the cursor, insert before a structural teleport anchor, or
+ *    trim the unclaimed SSR range the empty branch leaves behind.
+ * 4. `planRestartFromRuntimeComment` — the block is a bare runtime comment
+ *    (an empty branch created earlier in this same pass): reuse it if it is
+ *    still in the DOM, otherwise restart from the cursor and trim.
+ * 5. `planReuseBoundaryClose` — slots and multi-root `v-if` branches sit in
+ *    an SSR `<!--[-->…<!--]-->` range whose close marker is a stable anchor.
+ * 6. `planFromBlockBoundary` — fallback: derive parent/next from the
+ *    hydrated block itself (dynamic component, async component, keyed
+ *    fragment with single-root content).
+ *
+ * Marker discipline: a plan that adopts an SSR node claims it with
+ * `claimAnchor` (it keeps its logical position); a plan that creates a
+ * runtime anchor claims it with `claimUntrackedAnchor` (it holds no
+ * position, traversal skips it). `executeAnchorPlan` owns those side
+ * effects; the rules above are pure queries.
+ */
+
+/** Rule 1: the enclosing slot has not decided content vs fallback yet. */
+function planPendingSlotDecision(
   frag: DynamicFragment,
   isEmpty: boolean,
-): AnchorPlan {
-  const anchorLabel = frag.anchorLabel
-  const isNativeChildren = !!frag.nativeChildren
-  // A fragment owns/manages its own dynamic anchor when it carries a label or
-  // is a native-children fragment. Both branches are explicit so a future
-  // truthiness check on the (possibly empty) label can't silently exclude one.
-  const ownsDynamicAnchor = anchorLabel !== undefined || isNativeChildren
+): AnchorPlan | undefined {
+  // A render function can still produce invalid slot content. Keep its anchor
+  // pending just like an empty branch so fallback cleanup cannot detach the
+  // insertion point before the runtime anchor is created.
+  if (isPendingSlotContent() && (isEmpty || !isValidBlock(frag.nodes))) {
+    const slotEnd = getCurrentSlotEndAnchor()
+    const node = currentHydrationNode || slotEnd
+    if (node) {
+      const parent = getParentNode(node)
+      if (parent) {
+        return { kind: 'pending', parent, slotEnd }
+      }
+    }
+  }
+}
 
+/** Rule 2: adopt the anchor createPlainElement injected for native children. */
+function planReuseInjectedAnchor(
+  frag: DynamicFragment,
+): AnchorPlan | undefined {
   // Native-children fragments get a runtime anchor injected by
   // createPlainElement when SSR rendered no default-slot content. Whenever the
   // cursor still points at that injected anchor — the branch stayed empty, or
-  // it revived and hydrated its content ahead of the anchor — adopt it directly
-  // instead of creating a second one.
+  // it revived and hydrated its content ahead of the anchor — adopt it
+  // directly instead of creating a second one.
   if (
-    isNativeChildren &&
-    isHydrationAnchor(currentHydrationNode) &&
+    frag.__vf & NATIVE_CHILDREN &&
+    isClaimedAnchor(currentHydrationNode) &&
     getParentNode(currentHydrationNode!)
   ) {
     return { kind: 'reuse', node: currentHydrationNode! }
   }
+}
+
+/** Rule 3: the client rendered nothing for this branch. */
+function planEmptyBranch(frag: DynamicFragment): AnchorPlan | undefined {
+  const flags = frag.__vf
 
   // Empty fragments claim a current SSR anchor candidate directly. Later
   // fragments that need the same candidate create a fresh anchor after it.
-  if (isEmpty) {
-    if (isPendingSlotContent()) {
-      const slotEnd = getCurrentSlotEndAnchor()!
-      const node = currentHydrationNode || slotEnd
-      return {
-        kind: 'pending',
-        parent: getParentNode(node)!,
-        slotEnd,
-      }
-    }
-    if (isReusableAnchorCandidate(currentHydrationNode)) {
-      return reuseOrCreateAfterAnchor(currentHydrationNode)
-    }
-    if (
-      anchorLabel &&
-      currentHydrationNode &&
-      isComment(currentHydrationNode, 'teleport anchor')
-    ) {
-      const parentNode = getParentNode(currentHydrationNode)
-      if (parentNode) {
-        // Target-side teleport anchors are structural. Empty dynamic
-        // fragments insert their own anchor before the target anchor
-        // instead of consuming it as mismatched SSR content.
-        return {
-          kind: 'create',
-          parent: parentNode,
-          next: currentHydrationNode,
-          mark: currentHydrationNode,
-        }
-      }
-    }
-    if (
-      !frag.isSlot &&
-      ownsDynamicAnchor &&
-      currentHydrationNode &&
-      !isComment(currentHydrationNode, ']')
-    ) {
-      const parentNode = getParentNode(currentHydrationNode)
-      // Empty branch against non-empty SSR output has no block node to
-      // derive an insertion point from, so use the current hydration range.
-      if (isNativeChildren && parentNode) {
-        return {
-          kind: 'create-cleanup',
-          parent: parentNode,
-          next: null,
-          cleanupStart: currentHydrationNode,
-          cleanupUntil: null,
-          cleanupContainer: parentNode,
-        }
-      }
+  if (isReusableAnchorCandidate(currentHydrationNode, frag)) {
+    return reuseOrCreateAfterAnchor(currentHydrationNode)
+  }
 
-      if (parentNode) {
-        const anchor = nextLogicalSibling(currentHydrationNode)
-        if (
-          isReusableAnchorCandidate(anchor, anchorLabel) &&
-          getParentNode(anchor)
-        ) {
-          return reuseOrCreateAfterAnchor(anchor, true)
-        }
-        return {
-          kind: 'create-cleanup',
-          parent: parentNode,
-          next: anchor,
-          cleanupStart: currentHydrationNode,
-          cleanupUntil: anchor,
-        }
+  if (
+    !(flags & NATIVE_CHILDREN) &&
+    currentHydrationNode &&
+    isComment(currentHydrationNode, 'teleport anchor')
+  ) {
+    const parentNode = getParentNode(currentHydrationNode)
+    if (parentNode) {
+      // Target-side teleport anchors are structural. Empty dynamic
+      // fragments insert their own anchor before the target anchor
+      // instead of consuming it as mismatched SSR content.
+      return {
+        kind: 'create',
+        parent: parentNode,
+        next: currentHydrationNode,
+        mark: currentHydrationNode,
       }
     }
+  }
+
+  if (
+    !(flags & SLOT) &&
+    currentHydrationNode &&
+    !isComment(currentHydrationNode, ']')
+  ) {
+    const parentNode = getParentNode(currentHydrationNode)
+    // Empty branch against non-empty SSR output has no block node to
+    // derive an insertion point from, so use the current hydration range.
+    if (flags & NATIVE_CHILDREN && parentNode) {
+      return {
+        kind: 'create-cleanup',
+        parent: parentNode,
+        next: null,
+        cleanupStart: currentHydrationNode,
+        cleanupUntil: null,
+        cleanupContainer: parentNode,
+      }
+    }
+
+    if (parentNode) {
+      const anchor = nextLogicalSibling(currentHydrationNode)
+      if (isReusableAnchorCandidate(anchor, frag) && getParentNode(anchor)) {
+        return reuseOrCreateAfterAnchor(anchor, true)
+      }
+      return planTrimFromCursor(parentNode, anchor)
+    }
+  }
+}
+
+/** Trim the unclaimed SSR range at the cursor, then create a fresh anchor. */
+function planTrimFromCursor(parent: Node, next: Node | null): AnchorPlan {
+  return {
+    kind: 'create-cleanup',
+    parent,
+    next,
+    cleanupStart: currentHydrationNode!,
+    cleanupUntil: next,
+  }
+}
+
+/** Rule 4: the block is a bare runtime comment from earlier in this pass. */
+function planRestartFromRuntimeComment(
+  frag: DynamicFragment,
+): AnchorPlan | undefined {
+  if (isValidBlock(frag.nodes) || !(frag.nodes instanceof Comment)) {
+    return
   }
 
   // Reuse an existing SSR comment anchor for empty dynamic-component /
@@ -374,10 +608,7 @@ export function resolveDynamicAnchor(
   // end up creating a detached runtime anchor and lose the parent/sibling
   // position needed for same-hydration branch flips.
   if (
-    ownsDynamicAnchor &&
-    !isValidBlock(frag.nodes) &&
-    frag.nodes instanceof Comment &&
-    isReusableAnchorCandidate(frag.nodes, anchorLabel) &&
+    isReusableAnchorCandidate(frag.nodes, frag) &&
     getParentNode(frag.nodes)
   ) {
     return reuseOrCreateAfterAnchor(frag.nodes, true)
@@ -388,35 +619,28 @@ export function resolveDynamicAnchor(
   // derive the insertion point from the current hydration cursor rather
   // than from the detached block node, and let boundary cleanup trim the
   // SSR range before the next logical sibling.
-  if (
-    ownsDynamicAnchor &&
-    !isValidBlock(frag.nodes) &&
-    frag.nodes instanceof Comment &&
-    !getParentNode(frag.nodes) &&
-    currentHydrationNode
-  ) {
+  if (!getParentNode(frag.nodes) && currentHydrationNode) {
     const parentNode = getParentNode(currentHydrationNode)
-    const nextNode = nextLogicalSibling(currentHydrationNode)
     if (parentNode) {
-      return {
-        kind: 'create-cleanup',
-        parent: parentNode,
-        next: nextNode,
-        cleanupStart: currentHydrationNode,
-        cleanupUntil: nextNode,
-      }
+      return planTrimFromCursor(
+        parentNode,
+        nextLogicalSibling(currentHydrationNode),
+      )
     }
   }
+}
 
-  const currentSlotEndAnchor = getCurrentSlotEndAnchor()
-  const slotAnchor = frag.isSlot ? currentSlotEndAnchor : null
+/** Rule 5: slots and multi-root `v-if` reuse their SSR range's close marker. */
+function planReuseBoundaryClose(frag: DynamicFragment): AnchorPlan | undefined {
+  // Non-null only for slots, so it doubles as the "is a slot" test below.
+  const slotAnchor = frag.__vf & SLOT ? getCurrentSlotEndAnchor() : null
 
   // SSR wraps slots and multi-root `v-if` branches with `<!--[-->...<!--]-->`.
   // The close marker is a valid stable anchor candidate: reuse it once, or
   // create a fresh runtime anchor after it when another fragment already did.
   if (
-    frag.isSlot ||
-    (anchorLabel === 'if' && isArray(frag.nodes) && frag.nodes.length > 1)
+    slotAnchor ||
+    (!!(frag.__vf & IF) && isArray(frag.nodes) && frag.nodes.length > 1)
   ) {
     const anchor = locateHydrationBoundaryClose(
       slotAnchor || currentHydrationNode!,
@@ -426,28 +650,31 @@ export function resolveDynamicAnchor(
       return reuseOrCreateAfterAnchor(anchor)
     } else if (__DEV__) {
       throw new Error(
-        `Failed to locate ${anchorLabel} fragment anchor. this is likely a Vue internal bug.`,
+        `Failed to locate ${frag.anchorLabel} fragment anchor. this is likely a Vue internal bug.`,
       )
     }
   }
+}
 
-  // Otherwise, create a new anchor.
-  // This covers: dynamic-component, async component, keyed fragment.
+/** Rule 6: derive the anchor position from the hydrated block itself. */
+function planFromBlockBoundary(frag: DynamicFragment): AnchorPlan {
+  // Covers: dynamic component, async component, keyed fragment.
   const node = findBlockBoundary(frag.nodes)
-  const parentNode = node.parentNode
-  const nextNode = node.nextNode
-  let fallbackNext: Node | null = null
-  if (
-    currentSlotEndAnchor &&
-    nextNode === currentHydrationNode &&
-    parentNode &&
-    getParentNode(currentSlotEndAnchor) === parentNode
-  ) {
-    // `nextNode` can be stale fallback DOM that slot cleanup removes before the
-    // queued anchor insertion flushes. Keep the anchor inside the slot range.
-    fallbackNext = currentSlotEndAnchor
-  }
-  return { kind: 'create', parent: parentNode!, next: nextNode, fallbackNext }
+  return { kind: 'create', parent: node.parentNode!, next: node.nextNode }
+}
+
+export function resolveDynamicAnchor(
+  frag: DynamicFragment,
+  isEmpty: boolean,
+): AnchorPlan {
+  return (
+    planPendingSlotDecision(frag, isEmpty) ||
+    planReuseInjectedAnchor(frag) ||
+    (isEmpty ? planEmptyBranch(frag) : undefined) ||
+    planRestartFromRuntimeComment(frag) ||
+    planReuseBoundaryClose(frag) ||
+    planFromBlockBoundary(frag)
+  )
 }
 
 export function executeAnchorPlan(
@@ -458,7 +685,7 @@ export function executeAnchorPlan(
   let exitHydrationBoundary: (() => void) | undefined
 
   const createRuntimeAnchor = (): Node =>
-    (frag.anchor = markHydrationAnchor(
+    (frag.anchor = claimUntrackedAnchor(
       __DEV__ ? createComment(frag.anchorLabel ?? '') : createTextNode(),
     ))
 
@@ -466,7 +693,7 @@ export function executeAnchorPlan(
     switch (plan.kind) {
       case 'reuse': {
         if (plan.resetNodes) frag.nodes = EMPTY_BLOCK
-        frag.anchor = markHydrationAnchor(plan.node)
+        frag.anchor = claimAnchor(plan.node)
         if (currentHydrationNode === frag.anchor) {
           advanceHydrationNode(frag.anchor)
         } else {
@@ -488,27 +715,27 @@ export function executeAnchorPlan(
             if (
               node &&
               nodeParent === plan.parent &&
-              isReusableAnchorCandidate(node, frag.anchorLabel)
+              isReusableAnchorCandidate(node, frag)
             ) {
-              if (isHydrationAnchor(node)) {
+              if (isClaimedAnchor(node)) {
                 const nextNode = node.nextSibling
                 advanceHydrationNode(node)
                 nodeParent.insertBefore(createRuntimeAnchor(), nextNode)
               } else {
-                frag.anchor = markHydrationAnchor(node)
+                frag.anchor = claimAnchor(node)
                 advanceHydrationNode(node)
               }
               return
             }
             // Mismatch recovery can leave the cursor on fallback DOM instead
-            // of a reusable content anchor. Create this empty branch's
+            // of a reusable content anchor. Create this invalid branch's
             // runtime anchor before that DOM so later updates have a stable
             // insertion point.
-            const anchor = node && nodeParent === plan.parent ? node : slotEnd
-            const parentNode = getParentNode(anchor)
-            if (parentNode) {
-              parentNode.insertBefore(createRuntimeAnchor(), anchor)
-            }
+            insertUntrackedAnchor(
+              plan.parent,
+              node && nodeParent === plan.parent ? node : slotEnd,
+              createRuntimeAnchor(),
+            )
           },
           onFallback: () => {
             // Match CSR by always creating the content fragment anchor, even
@@ -520,19 +747,14 @@ export function executeAnchorPlan(
       }
       case 'create': {
         if (plan.resetNodes) frag.nodes = EMPTY_BLOCK
-        if (plan.mark) markHydrationAnchor(plan.mark)
-        queueAnchorInsert(
-          plan.parent,
-          plan.next,
-          createRuntimeAnchor,
-          plan.fallbackNext,
-        )
+        if (plan.mark) claimAnchor(plan.mark)
+        insertUntrackedAnchor(plan.parent, plan.next, createRuntimeAnchor())
         break
       }
       case 'create-cleanup': {
         frag.nodes = EMPTY_BLOCK
-        // The runtime anchor is inserted later. Until then, advance the cache
-        // to the surviving next sibling, or clear it when cleanup reaches the tail.
+        // Advance the cache to the surviving next sibling, or clear it when
+        // cleanup reaches the tail.
         const cleanupParent = getParentNode(plan.cleanupStart)
         if (cleanupParent) {
           updateLastLocatedLogicalChild(
@@ -548,7 +770,7 @@ export function executeAnchorPlan(
           cleanupHydrationTail(plan.cleanupStart, plan.cleanupContainer)
           setCurrentHydrationNode(null)
         }
-        queueAnchorInsert(plan.parent, plan.next, createRuntimeAnchor)
+        insertUntrackedAnchor(plan.parent, plan.next, createRuntimeAnchor())
         break
       }
     }

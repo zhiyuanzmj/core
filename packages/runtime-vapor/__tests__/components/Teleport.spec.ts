@@ -23,9 +23,10 @@ import {
   vaporInteropPlugin,
   withVaporDirectives,
 } from '@vue/runtime-vapor'
-import { makeRender } from '../_utils'
+import { compile, makeRender } from '../_utils'
 import {
   defineComponent,
+  effectScope,
   h,
   nextTick,
   onActivated,
@@ -33,6 +34,7 @@ import {
   onDeactivated,
   onMounted,
   onUnmounted,
+  queuePostFlushCb,
   reactive,
   ref,
   renderSlot,
@@ -204,6 +206,38 @@ describe('renderer: VaporTeleport', () => {
 
       expect(target.innerHTML).toBe('')
     })
+
+    test('should not initialize deferred children after owner scope stops', () => {
+      const root = document.createElement('div')
+      const target = document.createElement('div')
+      const mounted = vi.fn()
+      const Probe = defineVaporComponent(() => {
+        onMounted(mounted)
+        return template('<div>teleported</div>')()
+      })
+      const { mount } = define({
+        setup() {
+          const scope = effectScope()
+          const teleport = scope.run(() =>
+            createComp(
+              VaporTeleport,
+              {
+                to: () => target,
+                defer: () => true,
+              },
+              { default: () => createComp(Probe) },
+            ),
+          )!
+          queuePostFlushCb(() => scope.stop(), -1)
+          return teleport
+        },
+      }).create()
+
+      mount(root)
+
+      expect(mounted).not.toHaveBeenCalled()
+      expect(target.innerHTML).toBe('')
+    })
   })
 
   describe('HMR', () => {
@@ -292,8 +326,8 @@ describe('renderer: VaporTeleport', () => {
       const { mount, component: Parent } = define({
         __hmrId: parentId,
         render() {
-          const n2 = template('<div><div>root</div></div>', 1)() as any
-          setInsertionState(n2, 0)
+          const n2 = template('<div><!><div>root</div></div>', 1)() as any
+          setInsertionState(n2, child(n2))
           createComp(
             VaporTeleport,
             {
@@ -317,8 +351,8 @@ describe('renderer: VaporTeleport', () => {
 
       // rerender parent
       rerender(parentId, () => {
-        const n2 = template('<div><div>root 2</div></div>', 1)() as any
-        setInsertionState(n2, 0)
+        const n2 = template('<div><!><div>root 2</div></div>', 1)() as any
+        setInsertionState(n2, child(n2))
         createComp(
           VaporTeleport,
           {
@@ -1490,7 +1524,7 @@ function runSharedTests(deferMode: boolean): void {
           () => show.value,
           () => {
             const n0 = template('<div></div>')()
-            setInsertionState(n0 as any, null, 0)
+            setInsertionState(n0 as any)
             createComponent(
               VaporTeleport,
               {
@@ -1685,7 +1719,7 @@ function runSharedTests(deferMode: boolean): void {
       setup() {
         const n0 = template('<div id="tt"></div>')()
         const n4 = template('<div></div>')() as any
-        setInsertionState(n4, null, 0)
+        setInsertionState(n4)
         createComponent(
           VaporTeleport,
           { to: () => '#tt' },
@@ -1758,6 +1792,44 @@ function runSharedTests(deferMode: boolean): void {
   })
 }
 
+test('should dispose target after v-for fast remove clears it', async () => {
+  const items = ref([1])
+  const App = compile(
+    `<template>
+      <div id="teleport-fast-remove-target">
+        <template v-for="item in data" :key="item">
+          <Teleport to="#teleport-fast-remove-target">
+            <span>teleported</span>
+          </Teleport>
+          <i>item</i>
+        </template>
+      </div>
+    </template>`,
+    items,
+  )
+  const root = document.createElement('div')
+  document.body.appendChild(root)
+  const app = createVaporApp(App)
+
+  try {
+    app.mount(root)
+    await nextTick()
+    expect(
+      root.querySelector('#teleport-fast-remove-target')!.textContent,
+    ).toContain('teleported')
+
+    items.value = []
+    await nextTick()
+
+    expect(
+      root.querySelector('#teleport-fast-remove-target')!.textContent,
+    ).toBe('')
+  } finally {
+    app.unmount()
+    root.remove()
+  }
+})
+
 test('should clean up old anchors when target changes', async () => {
   const targetA = document.createElement('div')
   const targetB = document.createElement('div')
@@ -1821,6 +1893,44 @@ test('should not duplicate main-view anchors when keyed list reorders teleport r
 
   expect(countAnchors('start')).toBe(2)
   expect(countAnchors('end')).toBe(2)
+})
+
+test('should anchor mid-list reorders on the teleport main-view placeholder', async () => {
+  const target = document.createElement('div')
+  const items = ref([
+    { id: 'one', text: 'one' },
+    { id: 'two', text: 'two' },
+    { id: 'three', text: 'three' },
+  ])
+
+  const { host } = define(() =>
+    createFor(
+      () => items.value,
+      item =>
+        createComponent(
+          VaporTeleport,
+          { to: () => target },
+          { default: () => template(item.value.text)() },
+        ),
+      item => item.id,
+    ),
+  ).render()
+
+  const countAnchors = (label: 'start' | 'end') =>
+    (host.innerHTML.match(new RegExp(`<!--teleport ${label}-->`, 'g')) || [])
+      .length
+
+  expect(countAnchors('start')).toBe(3)
+  expect(target.textContent).toBe('onetwothree')
+
+  // the moved row must resolve its anchor through the following teleport
+  // row's main-view placeholder, not its teleported content
+  items.value = [items.value[1], items.value[0], items.value[2]]
+  await nextTick()
+
+  expect(countAnchors('start')).toBe(3)
+  expect(countAnchors('end')).toBe(3)
+  expect(target.textContent).toBe('onetwothree')
 })
 
 test('should not move target children when keyed list reorders enabled teleport roots', async () => {

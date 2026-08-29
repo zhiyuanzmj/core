@@ -1,4 +1,4 @@
-import { bench, describe } from 'vitest'
+import { bench, describe } from 'vite-plus/test'
 import { shallowRef } from '@vue/reactivity'
 import {
   type Block,
@@ -33,7 +33,7 @@ function createComponent(node: Node): VaporComponentInstance {
 }
 
 function createDynamicFragment(node: Node): DynamicFragment {
-  const fragment = new DynamicFragment('dynamic-component', false, false)
+  const fragment = new DynamicFragment(0, 'dynamic-component', false, false)
   fragment.nodes = node
   return fragment
 }

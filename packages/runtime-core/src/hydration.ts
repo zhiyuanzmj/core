@@ -12,11 +12,7 @@ import {
   normalizeVNode,
 } from './vnode'
 import { flushPostFlushCbs } from './scheduler'
-import type {
-  ComponentInternalInstance,
-  ComponentOptions,
-  ConcreteComponent,
-} from './component'
+import type { ComponentInternalInstance, ConcreteComponent } from './component'
 import { invokeDirectiveHook } from './directives'
 import { warn } from './warning'
 import {
@@ -38,6 +34,7 @@ import {
   stringifyStyle,
 } from '@vue/shared'
 import {
+  type ElementNamespace,
   type RendererInternals,
   getVaporInterface,
   needTransition,
@@ -92,12 +89,24 @@ const isSVGContainer = (container: Element) =>
   container.namespaceURI!.includes('svg') &&
   container.tagName !== 'foreignObject'
 
-const isMathMLContainer = (container: Element) =>
-  container.namespaceURI!.includes('MathML')
+const isMathMLContainer = (container: Element) => {
+  if (!container.namespaceURI!.includes('MathML')) return false
+  // <annotation-xml encoding="...html"> switches its children back to HTML,
+  // mirroring `resolveChildrenNamespace` on the mount path.
+  if (container.tagName !== 'annotation-xml') return true
+  const encoding = container.getAttribute('encoding')
+  return !encoding || !encoding.includes('html')
+}
 
-const getContainerType = (
+/**
+ * Resolve the element namespace a container's children should be created in.
+ * The live DOM is the source of truth, so this also covers containers that are
+ * only known at runtime (interop boundaries, teleport targets).
+ * @internal
+ */
+export const getContainerType = (
   container: Element | ShadowRoot,
-): 'svg' | 'mathml' | undefined => {
+): ElementNamespace => {
   if (container.nodeType !== DOMNodeTypes.ELEMENT) return undefined
   if (isSVGContainer(container as Element)) return 'svg'
   if (isMathMLContainer(container as Element)) return 'mathml'
@@ -287,6 +296,7 @@ export function createHydrationFunctions(
           node,
           parentComponent,
           parentSuspense,
+          slotScopeIds,
         )
         break
       default:
@@ -392,17 +402,18 @@ export function createHydrationFunctions(
             // #3787
             // An async component may move or unmount before its render effect
             // exists, so keep a placeholder vnode that matches its adopted DOM.
-            // The wrapper check preserves lazy hydration behavior; asyncDep
-            // covers plain async setup under Suspense.
+            //
+            // This covers unresolved async wrappers, lazy hydration wrappers
+            // whose subtree was deferred, and plain async setup under Suspense.
             const component = vnode.component!
             if (
-              (isAsyncWrapper(vnode) &&
-                !(vnode.type as ComponentOptions).__asyncResolved) ||
-              (component.asyncDep && !component.asyncResolved)
+              !component.subTree &&
+              (isAsyncWrapper(vnode) ||
+                (component.asyncDep && !component.asyncResolved))
             ) {
               let subTree
               if (isFragmentStart) {
-                subTree = createVNode(Fragment)
+                subTree = createVNode(Static)
                 subTree.anchor = nextNode
                   ? nextNode.previousSibling
                   : container.lastChild
@@ -613,6 +624,9 @@ export function createHydrationFunctions(
               (isCustomElement && !isReservedProp(key)) ||
               (dynamicProps && dynamicProps.includes(key))
             ) {
+              if (isUnchangedResourceProp(el, key, props[key])) {
+                continue
+              }
               patchProp(el, key, null, props[key], namespace, parentComponent)
             }
           }
@@ -834,7 +848,7 @@ export function createHydrationFunctions(
       slotScopeIds,
     )
     // the component vnode's el should be updated when a mismatch occurs.
-    if (parentComponent) {
+    if (parentComponent && parentComponent.vnode) {
       parentComponent.vnode.el = vnode.el
       updateHOCHostEl(parentComponent, vnode.el)
     }
@@ -878,7 +892,7 @@ export function createHydrationFunctions(
     // update vnode
     let parent = parentComponent
     while (parent) {
-      if (parent.vnode.el === oldNode) {
+      if (parent.vnode && parent.vnode.el === oldNode) {
         parent.vnode.el = parent.subTree.el = newNode
       }
       parent = parent.parent as ComponentInternalInstance
@@ -898,6 +912,24 @@ export const isTemplateNode = (node: Node): node is HTMLTemplateElement => {
 /**
  * Dev only
  */
+// attributes whose assignment triggers a (re)fetch of a resource
+const resourceProps = /*@__PURE__*/ new Set(['src', 'srcset', 'href', 'poster'])
+
+function isUnchangedResourceProp(
+  el: Element,
+  key: string,
+  clientValue: any,
+): boolean {
+  if (!resourceProps.has(key)) {
+    return false
+  }
+  // compare against the rendered attribute rather than the reflected DOM
+  // property, which normalizes URLs to absolute form.
+  return (
+    el.getAttribute(key) === (clientValue == null ? null : `${clientValue}`)
+  )
+}
+
 function propHasMismatch(
   el: Element & { $cls?: string },
   key: string,
@@ -970,7 +1002,10 @@ export function getAttributeMismatch(
 } {
   let actual: string | boolean | null | undefined
   let expected: string | boolean | null | undefined
-  if (isBooleanAttr(key)) {
+  if (key === 'hidden') {
+    actual = normalizeHiddenValue(el.getAttribute(key))
+    expected = normalizeHiddenValue(clientValue)
+  } else if (isBooleanAttr(key)) {
     actual = el.hasAttribute(key)
     expected = includeBooleanAttr(clientValue)
   } else if (clientValue == null) {
@@ -1024,6 +1059,18 @@ export function warnPropMismatch(
     return true
   }
   return false
+}
+
+function normalizeHiddenValue(value: unknown): false | '' | 'until-found' {
+  if (!isRenderableAttrValue(value)) {
+    return false
+  }
+  if (isString(value)) {
+    // Attribute values from the DOM are strings, while numeric client values
+    // follow the `hidden` property setter, where 0 and NaN remove the attribute.
+    return value.toLowerCase() === 'until-found' ? 'until-found' : ''
+  }
+  return includeBooleanAttr(value) ? '' : false
 }
 
 export function toClassSet(str: string): Set<string> {

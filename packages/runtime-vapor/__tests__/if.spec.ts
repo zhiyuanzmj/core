@@ -12,7 +12,7 @@ import {
 } from '../src'
 import { nextTick, ref } from '@vue/runtime-dom'
 import { VaporBlockShape, VaporIfFlags } from '@vue/shared'
-import type { Mock } from 'vitest'
+import type { Mock } from 'vite-plus/test'
 import { compile, ifFlags, makeRender } from './_utils'
 import { setElementText } from '../src/dom/prop'
 import type { DynamicFragment } from '../src/fragment'
@@ -290,9 +290,11 @@ describe('createIf', () => {
     ).render()
 
     expect(host.innerHTML).toBe('<div id="a">foo</div><!--if-->')
-    expect(frag.scope).toBeUndefined()
+    // branch-owned from the first render on: the no-scope branch gets a
+    // retrofitted scope so the fallthrough effect dies with the branch
+    expect(frag.scope).toBeDefined()
     expect((frag as any).attrs).toBeUndefined()
-    expect((frag as any).hasFallthroughAttrs).toBe(true)
+    expect((frag as any).fallthrough).toBeTruthy()
 
     id.value = 'b'
     await nextTick()

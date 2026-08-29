@@ -1,9 +1,14 @@
 import type { LooseRawProps } from './component'
 import type { RawSlots } from './componentSlots'
 import type { TeleportFragment } from './components/Teleport'
+import { TELEPORT } from './fragmentFlags'
 
 type VaporTeleportLike = {
-  process(props: LooseRawProps, slots?: RawSlots | null): TeleportFragment
+  process(
+    props: LooseRawProps,
+    slots?: RawSlots | null,
+    adoptAnchor?: Node,
+  ): TeleportFragment
 }
 
 export let isTeleportEnabled = false
@@ -18,5 +23,5 @@ export function isVaporTeleport(value: unknown): value is VaporTeleportLike {
 }
 
 export function isTeleportFragment(value: unknown): value is TeleportFragment {
-  return !!(value && (value as any).__tf)
+  return !!(value && (value as any).__vf & TELEPORT)
 }

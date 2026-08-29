@@ -23,7 +23,7 @@ import {
   vShowHidden,
   warn,
 } from '@vue/runtime-dom'
-import { extend, isArray } from '@vue/shared'
+import { extend, isArray, isFunction } from '@vue/shared'
 import {
   type Block,
   type BlockFn,
@@ -44,7 +44,7 @@ import {
   type VaporComponentOptions,
   isVaporComponent,
 } from '../component'
-import { resolveDynamicProps } from '../componentProps'
+import { type RawProps, resolveDynamicProps } from '../componentProps'
 import { setForHydrationAnchorResolver } from '../apiCreateFor'
 import { createComment, createElement, createTextNode } from '../dom/node'
 import {
@@ -61,10 +61,10 @@ import {
 import { EffectFlags, ReactiveEffect } from '@vue/reactivity'
 import {
   adoptTemplate,
+  claimAnchor,
   cleanupHydrationTail,
   currentHydrationNode,
   isHydrating,
-  markHydrationAnchor,
   nextLogicalSibling,
   setCurrentHydrationNode,
 } from '../dom/hydration'
@@ -110,7 +110,7 @@ function ensureForHydrationAnchorResolver(): void {
       anchorNode.parentNode === container
         ? anchorNode
         : null
-    const parentAnchor = markHydrationAnchor(
+    const parentAnchor = claimAnchor(
       __DEV__ ? createComment('for') : createTextNode(),
     )
     container.insertBefore(parentAnchor, anchor)
@@ -155,11 +155,6 @@ const VaporTransitionGroupImpl = /*@__PURE__*/ defineVaporComponent({
       },
     })
 
-    renderEffect(
-      () => (cssTransitionProps = resolveTransitionProps(props)),
-      true,
-    )
-
     let prevChildren: ResolvedTransitionBlock[] = []
     // Multiple child owners can update in the same flush (e.g. a VDOM child
     // props update plus the surrounding v-for keyed diff). Keep the first old
@@ -172,7 +167,14 @@ const VaporTransitionGroupImpl = /*@__PURE__*/ defineVaporComponent({
       if (isUpdatePending) return
       isUpdatePending = true
       prevChildren = []
-      const children = resolveTransitionBlocks(slottedBlock)
+      // collect-only: the snapshot loop below reads elements and existing
+      // hooks; skip owner tracking and key-inheritance bookkeeping.
+      const children = resolveTransitionBlocks(
+        slottedBlock,
+        undefined,
+        undefined,
+        true,
+      )
       for (let i = 0; i < children.length; i++) {
         const child = children[i]
         const el =
@@ -211,7 +213,12 @@ const VaporTransitionGroupImpl = /*@__PURE__*/ defineVaporComponent({
       )
       prevChildren.forEach(child => {
         child.$transition!.disabled = false
-        if (hasMove) callPendingCbs(child)
+        if (hasMove) {
+          // pending enter/move cbs live on the element, which for interop
+          // children is not the block itself
+          const el = getTransitionElement(child)
+          if (el) callPendingCbs(el)
+        }
       })
       if (!hasMove) {
         prevChildren = []
@@ -221,8 +228,9 @@ const VaporTransitionGroupImpl = /*@__PURE__*/ defineVaporComponent({
       prevChildren.forEach(recordPosition)
       const movedChildren = prevChildren.filter(applyTranslation)
 
-      // force reflow to put everything in position
-      forceReflow()
+      // force reflow to put everything in position; use the group's own
+      // document so this works inside iframes / foreign documents
+      forceReflow(firstChild)
 
       movedChildren.forEach(c =>
         handleMovedChildren(
@@ -241,11 +249,33 @@ const VaporTransitionGroupImpl = /*@__PURE__*/ defineVaporComponent({
 
     onBeforeUpdate(beforeUpdate)
     onUpdated(updated)
+    const updateHooks: TransitionGroupUpdateHookRef = { beforeUpdate, updated }
 
-    const frag = new DynamicFragment('transition-group')
+    const frag = new DynamicFragment(
+      0,
+      __DEV__ ? 'transition-group' : undefined,
+    )
     let currentTag: string | undefined
     let currentSlot: BlockFn | undefined
     let isMounted = false
+
+    renderEffect(() => {
+      cssTransitionProps = resolveTransitionProps(props)
+      // The shared baseResolveTransitionHooks destructures props eagerly, so
+      // hooks already applied to mounted children capture stale values when
+      // reactive transition props change. Mirror Transition's re-resolve by
+      // re-applying group hooks onto the current children. Children mid-leave
+      // are no longer collected and keep the hooks their leave started with.
+      if (isMounted) {
+        applyGroupTransitionHooks(
+          slottedBlock,
+          propsProxy,
+          state,
+          instance,
+          updateHooks,
+        )
+      }
+    }, true)
 
     renderEffect(() => {
       const tag = props.tag
@@ -279,7 +309,7 @@ const VaporTransitionGroupImpl = /*@__PURE__*/ defineVaporComponent({
             propsProxy,
             state,
             instance,
-            { beforeUpdate, updated },
+            updateHooks,
           )
           if (container) {
             if (!isHydrating) insert(block, container)
@@ -337,8 +367,14 @@ export function resolveTransitionBlocks(
   block: Block,
   onFragment?: (frag: VaporFragment) => void,
   onUpdateOwner?: (owner: TransitionGroupUpdateOwner) => void,
+  // collect elements only, skipping key/type inheritance side effects
+  collectOnly = false,
 ): ResolvedTransitionBlock[] {
   const children: ResolvedTransitionBlock[] = []
+  if (collectOnly) {
+    collectTransitionBlocks(block, children, onFragment, onUpdateOwner, true)
+    return children
+  }
   const prevGeneration = currentTransitionKeyGeneration
   currentTransitionKeyGeneration = ++transitionKeyGeneration
   try {
@@ -354,6 +390,7 @@ function collectTransitionBlocks(
   children: ResolvedTransitionBlock[],
   onFragment?: (frag: VaporFragment) => void,
   onUpdateOwner?: (owner: TransitionGroupUpdateOwner) => void,
+  collectOnly = false,
 ): void {
   if (block instanceof Node) {
     if (block instanceof Element) children.push(block)
@@ -367,26 +404,50 @@ function collectTransitionBlocks(
       children,
       onFragment,
       isRootSlot ? onUpdateOwner : undefined,
+      collectOnly,
     )
-    if (!isRootSlot) {
-      for (let i = start; i < children.length; i++) {
-        setTransitionType(children[i], block.type)
+    if (!collectOnly) {
+      if (!isRootSlot) {
+        for (let i = start; i < children.length; i++) {
+          setTransitionType(children[i], block.type)
+        }
       }
+      inheritTransitionKey(children, start, block.$key)
     }
-    inheritTransitionKey(children, start, block.$key)
   } else if (isArray(block)) {
     for (let i = 0; i < block.length; i++) {
-      collectTransitionBlocks(block[i], children, onFragment, onUpdateOwner)
+      collectTransitionBlocks(
+        block[i],
+        children,
+        onFragment,
+        onUpdateOwner,
+        collectOnly,
+      )
     }
   } else if (isFragment(block)) {
-    if (onFragment) onFragment(block)
-    if (onUpdateOwner) onUpdateOwner(block)
-    if (isInteropEnabled && block.vnode) {
+    // ForBlock wrappers have no transition consumers of their own: they
+    // override neither insert nor remove (the only readers of fragment
+    // $transition) and their update hook arrays are never invoked. Skip the
+    // per-item hook/owner bookkeeping and only collect their contents.
+    const isItem = isForBlock(block)
+    if (!isItem) {
+      if (onFragment) onFragment(block)
+      if (onUpdateOwner) onUpdateOwner(block)
+    }
+    if (isInteropEnabled && block.hasVDOMContent && block.hasVDOMContent()) {
       children.push(block)
     } else {
       const start = children.length
-      collectTransitionBlocks(block.nodes, children, onFragment, onUpdateOwner)
-      if (isForBlock(block)) {
+      collectTransitionBlocks(
+        block.nodes,
+        children,
+        onFragment,
+        onUpdateOwner,
+        collectOnly,
+      )
+      if (collectOnly) {
+        // element collection only; keys were stamped by the apply pass
+      } else if (isItem) {
         const count = children.length - start
         for (let i = start; i < children.length; i++) {
           children[i].$key =
@@ -448,12 +509,17 @@ function applyGroupTransitionHooks(
     const child = children[i]
     if (isValidTransitionBlock(child)) {
       if (child.$key != null) {
+        const prev = child.$transition
         child.$transition = resolveTransitionHooks(
           child,
           props,
           state,
           instance,
         )
+        // Carry the FLIP-measurement latch across hook re-resolution (a props
+        // re-apply or slot re-render can land between beforeUpdate and
+        // flushUpdated); flushUpdated resets it on the live hooks object.
+        if (prev && prev.disabled) child.$transition.disabled = true
       } else if (__DEV__) {
         warn(`<transition-group> children must be keyed`)
       }
@@ -481,43 +547,59 @@ function trackTransitionGroupUpdate(
     return
   }
 
-  transitionGroupUpdateOwnerMap.set(owner, updateHooks)
   if (isFragment(owner)) {
+    transitionGroupUpdateOwnerMap.set(owner, updateHooks)
     ;(owner.onBeforeUpdate ||= []).push(() => updateHooks.beforeUpdate())
     ;(owner.onUpdated ||= []).push(() => updateHooks.updated())
-  } else {
-    // A component child can update from parent-driven props without re-running
-    // the surrounding v-for fragment. Track raw props directly instead of
-    // using component updated hooks, because child-local state updates should
-    // not trigger TransitionGroup move bookkeeping. This matches VDOM behavior.
-    let isPending = false
+    return
+  }
+
+  // Fully static raw props can never notify - skip the tracking effect.
+  if (!hasDynamicPropsSource(owner.rawProps)) return
+
+  transitionGroupUpdateOwnerMap.set(owner, updateHooks)
+  // A component child can update from parent-driven props without re-running
+  // the surrounding v-for fragment. Track raw props directly instead of
+  // using component updated hooks, because child-local state updates should
+  // not trigger TransitionGroup move bookkeeping. This matches VDOM behavior.
+  let isPending = false
+  owner.scope.run(() => {
+    const effect = new ReactiveEffect(() => {
+      // Dynamic prop sources are resolved as child props, so the getter
+      // must run with the child instance while the effect itself remains
+      // owned by the child scope for teardown.
+      const prev = setCurrentInstance(owner, owner.scope)
+      try {
+        resolveDynamicProps(owner.rawProps)
+      } finally {
+        restoreCurrentInstance(prev)
+      }
+    })
     const flushUpdated = () => {
       isPending = false
+      // Deferred re-track: `dirty` stays set until this run and `isPending`
+      // short-circuits the notifies in between, so a batch touching N props
+      // of one child resolves them once instead of N times.
+      if (effect.active) effect.run()
       updateHooks.updated()
     }
-    owner.scope.run(() => {
-      const effect = new ReactiveEffect(() => {
-        // Dynamic prop sources are resolved as child props, so the getter
-        // must run with the child instance while the effect itself remains
-        // owned by the child scope for teardown.
-        const prev = setCurrentInstance(owner, owner.scope)
-        try {
-          resolveDynamicProps(owner.rawProps)
-        } finally {
-          restoreCurrentInstance(prev)
-        }
-      })
-      effect.notify = () => {
-        if (effect.flags & EffectFlags.PAUSED || !effect.dirty) return
-        effect.run()
-        if (isPending) return
-        isPending = true
-        updateHooks.beforeUpdate()
-        queuePostFlushCb(flushUpdated)
-      }
-      effect.run()
-    })
+    effect.notify = () => {
+      if (effect.flags & EffectFlags.PAUSED || !effect.dirty) return
+      if (isPending) return
+      isPending = true
+      updateHooks.beforeUpdate()
+      queuePostFlushCb(flushUpdated)
+    }
+    effect.run()
+  })
+}
+
+function hasDynamicPropsSource(props: RawProps): boolean {
+  if (props.$) return true
+  for (const key in props) {
+    if (key !== '$' && isFunction(props[key])) return true
   }
+  return false
 }
 
 function recordPosition(c: ResolvedTransitionBlock) {

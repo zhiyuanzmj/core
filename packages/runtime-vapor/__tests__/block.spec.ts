@@ -1,14 +1,28 @@
+import { shallowRef } from '@vue/reactivity'
 import {
   insert,
   insertFragment,
   insertNode,
   normalizeBlock,
-  prepend,
   remove,
   removeFragment,
   removeNode,
 } from '../src/block'
-import { VaporFragment } from '../src/fragment'
+import {
+  DynamicFragment,
+  ForBlock,
+  ForFragment,
+  SlotFragment,
+  VaporFragment,
+  isDynamicFragment,
+  isForBlock,
+  isForFragment,
+  isFragment,
+  isInteropFragment,
+  isSlotFragment,
+} from '../src/fragment'
+import { TeleportFragment } from '../src/components/Teleport'
+import { isTeleportFragment } from '../src/teleport'
 
 const node1 = document.createTextNode('node1')
 const node2 = document.createTextNode('node2')
@@ -41,9 +55,18 @@ describe('block + node ops', () => {
     insert([], container, node3)
     expect(Array.from(container.childNodes)).toEqual([node2, anchor, node1])
 
-    expect(() => insert(node3, container, node3)).toThrowError(
-      'The child can not be found in the parent.',
-    )
+    // self-insert is a guarded no-op: fragment anchors travel inside
+    // frag.nodes (ForFragment, interop fragments) and re-insert with the
+    // anchor as the target
+    container.appendChild(node3)
+    insert(node3, container, node3)
+    expect(Array.from(container.childNodes)).toEqual([
+      node2,
+      anchor,
+      node1,
+      node3,
+    ])
+    node3.remove()
   })
 
   test('single node helpers', () => {
@@ -97,13 +120,6 @@ describe('block + node ops', () => {
     expect(Array.from(container.childNodes)).toEqual([])
   })
 
-  test('prepend', () => {
-    const container = document.createElement('div')
-    prepend(container, [node1], node2)
-    prepend(container, new VaporFragment(node3))
-    expect(Array.from(container.childNodes)).toEqual([node3, node1, node2])
-  })
-
   test('remove', () => {
     const container = document.createElement('div')
     container.append(node1, node2, node3)
@@ -115,5 +131,45 @@ describe('block + node ops', () => {
     expect(() => remove(anchor, container)).toThrowError(
       'The node to be removed is not a child of this node.',
     )
+  })
+})
+
+describe('fragment protocol flags', () => {
+  test('identify constructor-owned roles without class or shape checks', () => {
+    const fragment = new VaporFragment(node1)
+    const dynamic = new DynamicFragment(0, undefined, false, false)
+    const slot = new SlotFragment()
+    const forFragment = new ForFragment([], false)
+    const forBlock = new ForBlock(
+      node2,
+      undefined,
+      shallowRef(0),
+      undefined,
+      undefined,
+      0,
+    )
+    const teleport = new TeleportFragment({ to: document.body })
+
+    for (const value of [
+      fragment,
+      dynamic,
+      slot,
+      forFragment,
+      forBlock,
+      teleport,
+    ]) {
+      expect(isFragment(value)).toBe(true)
+    }
+    expect(isDynamicFragment(dynamic)).toBe(true)
+    expect(isSlotFragment(slot)).toBe(true)
+    expect(isForFragment(forFragment)).toBe(true)
+    expect(isForBlock(forBlock)).toBe(true)
+    expect(isTeleportFragment(teleport)).toBe(true)
+
+    expect(isSlotFragment(dynamic)).toBe(false)
+    expect(isDynamicFragment(fragment)).toBe(false)
+    expect(isForFragment(forBlock)).toBe(false)
+    expect(isForBlock(forFragment)).toBe(false)
+    expect(isInteropFragment(fragment)).toBe(false)
   })
 })
